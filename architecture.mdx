@@ -1,0 +1,84 @@
+---
+title: "XLA Architecture"
+description: "An overview of how the XLA compiler is structured: its objectives, the StableHLO input format, and the three-stage compilation pipeline that produces optimized machine code."
+---
+
+XLA (Accelerated Linear Algebra) is a machine learning compiler that optimizes linear algebra computations, providing improvements in execution speed and memory usage. XLA supports several ML framework frontends — including PyTorch, TensorFlow, and JAX — as part of the OpenXLA project.
+
+## Objectives
+
+XLA was originally developed inside the TensorFlow project. After the OpenXLA project was created, its fundamental objectives remain the same:
+
+- **Improve execution speed.** Compile subgraphs to reduce the execution time of short-lived ops and eliminate overhead from the runtime, fuse pipelined operations to reduce memory overhead, and specialize known tensor shapes to allow for more aggressive constant propagation.
+
+- **Improve memory usage.** Analyze and schedule memory usage, eliminating many intermediate storage buffers.
+
+- **Reduce reliance on custom ops.** Remove the need for many custom ops by improving the performance of automatically fused low-level ops to match the performance of custom ops that were originally fused by hand.
+
+- **Improve portability.** Make it relatively easy to write a new backend for novel hardware, so that a large fraction of ML models can run unmodified on that hardware. This contrasts with the approach of specializing individual monolithic ops for new hardware, which requires models to be rewritten to make use of those ops.
+
+## How it works
+
+The XLA compiler takes model graphs from ML frameworks defined in [StableHLO](https://github.com/openxla/stablehlo) and compiles them into machine instructions for various architectures. StableHLO defines a versioned operation set (HLO = high level operations) that provides a portability layer between ML frameworks and the compiler.
+
+```
+ML Framework (PyTorch / TensorFlow / JAX)
+              |
+              v
+          StableHLO
+              |
+     Stage 1: Target-independent optimization
+     (CSE, operation fusion, buffer analysis)
+              |
+           HLO IR
+              |
+     Stage 2: Backend-specific HLO optimization
+     (GPU stream partitioning, library call matching)
+              |
+           HLO IR
+              |
+     Stage 3: Target-specific code generation via LLVM
+     (LLVM IR emission → native machine code)
+              |
+              v
+      Executable (machine code + ThunkSequence)
+```
+
+## Compilation pipeline
+
+<Steps>
+  <Step title="Target-independent optimization">
+    XLA performs several built-in optimization and analysis passes on the StableHLO graph that are target-independent. These include:
+
+    - **CSE** (Common Subexpression Elimination): deduplicates redundant computations
+    - **Target-independent operation fusion**: combines compatible ops to reduce kernel launch overhead
+    - **Buffer analysis**: allocates runtime memory for the computation
+
+    During this stage, XLA also converts the StableHLO dialect into its internal **HLO dialect**. HLO is not based on MLIR — it has its own textual syntax and binary (protobuf-based) representation.
+  </Step>
+  <Step title="Backend-specific HLO optimization">
+    XLA sends the HLO computation to a backend for further HLO-level optimizations, this time with target-specific information and needs in mind.
+
+    For example, the GPU backend may:
+
+    - Perform operation fusions that are beneficial specifically for the GPU programming model
+    - Determine how to partition the computation into streams
+    - Pattern-match certain operations or combinations thereof to optimized library calls (e.g., cuBLAS)
+  </Step>
+  <Step title="Target-specific code generation">
+    The backend performs target-specific code generation. The CPU and GPU backends included with XLA use [LLVM](http://llvm.org) for low-level IR, optimization, and code generation.
+
+    These backends emit the LLVM IR necessary to represent the HLO computation in an efficient manner, then invoke LLVM to emit native code from this LLVM IR.
+
+    - The GPU backend currently supports NVIDIA GPUs via the LLVM NVPTX backend
+    - The CPU backend supports multiple CPU ISAs
+
+    The final output is an `Executable` containing compiled machine code, a `ThunkSequence` (the runtime execution plan), and `BufferAssignment` metadata describing memory layout.
+  </Step>
+</Steps>
+
+## Modularity and extensibility
+
+The XLA compiler is modular: it is straightforward to add an alternative backend to target a novel hardware architecture. The separation between target-independent optimization (Stage 1) and target-specific work (Stages 2–3) means that most of the optimization logic is reusable across backends.
+
+To learn how to write a new backend, see [Developing a new backend](/extending/developing-new-backend).

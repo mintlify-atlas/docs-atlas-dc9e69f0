@@ -1,0 +1,127 @@
+---
+title: "Asynchronous Operations"
+description: "How XLA models asynchronous operations using async-start, async-update, and async-done HLO instructions."
+keywords: ["XLA", "async", "asynchronous", "HLO", "async-start", "async-done"]
+---
+
+XLA supports asynchronous execution of HLO operations through a generic mechanism based on three opcodes:
+`kAsyncStart`, `kAsyncUpdate`, and `kAsyncDone`.
+
+## The async model
+
+The async model wraps any HLO instruction with a generic asynchronous opcode. The actual operation
+is encoded using a called computation that has the instruction as its root and parameters for its inputs.
+In-flight input/output buffer handling and aliasing are shared for any asynchronous operation.
+
+The `async-start` instruction's output shape is a tuple of:
+1. The input operands
+2. The output values
+3. Any intermediate state needed for `async-update` or `async-done`
+
+<Note>
+`AsyncStart`, `AsyncUpdate`, and `AsyncDone` are internal HLO primitives. They may appear in HLO
+dumps but are not intended to be constructed manually by end users. They are not found in StableHLO.
+</Note>
+
+## Basic async-start / async-done pattern
+
+The simplest form uses just `async-start` and `async-done`:
+
+```hlo
+%async_op {
+  %param0 = f32[64] parameter(0)
+  ROOT %op = f32[32] op(f32[64] %param0), op_specific_attr="foo"
+}
+
+%async-start = (f32[64], f32[32], s32[]) async-start(f32[64] %operand),
+                                         calls=%async_op
+%async-done = f32[32] async-done((f32[64], f32[32], s32[]) %async-start)
+```
+
+The first element of the `async-start` output tuple aliases with the operand (keeping the buffer
+alive until at least `async-done`). The second element aliases with the output of `async-done`.
+The third element is the context state for tracking the asynchronous operation.
+
+## Multiple inputs and outputs
+
+Aliasing works the same way when the operation has multiple input/output tensors:
+
+```hlo
+%async_op {
+  %param0 = f32[64] parameter(0)
+  %param1 = f32[64] parameter(1)
+  ROOT %op = (f32[32], f32[32]) op(f32[64] %param0, f32[64] %param1),
+                                op_specific_attr="foo"
+}
+
+%async-start = ((f32[64], f32[64]), (f32[32], f32[32]), s32[])
+               async-start(f32[64] %operand0, f32[64] %operand1),
+               calls=%async_op
+%async-done = (f32[32], f32[32]) async-done(%async-start)
+```
+
+## async-update for intermediate steps
+
+Zero or more `async-update` steps can perform intermediate computations between
+`async-start` and `async-done`. Each `async-start` and `async-update` instruction
+must have exactly one user that is either another `async-update` or `async-done`:
+
+```hlo
+%async_op {
+  %param0 = f32[64] parameter(0)
+  ROOT %op = f32[32] op(f32[64] %param0), op_specific_attr="foo"
+}
+
+%async-start = (f32[64], f32[32], s32[]) async-start(f32[64] %operand),
+                                         calls=%async_op
+%async-update0 = (f32[64], f32[32], s32[]) async-update(
+                           (f32[64], f32[32], s32[]) %async-start)
+%async-update1 = (f32[64], f32[32], s32[]) async-update(
+                           (f32[64], f32[32], s32[]) %async-update0)
+%async-done = f32[32] async-done((f32[64], f32[32], s32[]) %async-update1)
+```
+
+## Syntax sugar
+
+Having a separate computation to define the asynchronous operation is verbose.
+XLA provides syntax sugar that automatically creates the computation and instruction
+when parsing using the `-start`, `-update`, and `-done` suffixes.
+
+The verbose form above can be equivalently written as:
+
+```hlo
+%op-start = (f32[64], f32[32], s32[]) op-start(f32[64] %operand),
+                                      op_specific_attr="foo"
+%op-update0 = (f32[64], f32[32], s32[]) op-update(
+                        (f32[64], f32[32], s32[]) %op-start),
+                        op_specific_attr="foo"
+%op-update1 = (f32[64], f32[32], s32[]) op-update(
+                        (f32[64], f32[32], s32[]) %op-update0)
+%op-done = f32[32] op-done((f32[64], f32[32], s32[]) %op-update1)
+```
+
+Both representations parse to the same internal structure.
+
+## Existing async opcodes
+
+Some operations already have first-class async opcodes (using explicit `-start`/`-done` pairs)
+and continue to use them instead of the generic `async-start`/`async-done`:
+
+- `copy-start` / `copy-done`
+- `collective-permute-start` / `collective-permute-done`
+- `all-gather-start` / `all-gather-done`
+- `all-reduce-start` / `all-reduce-done`
+
+<Warning>
+The verifier does not allow wrapping an operation with `async-start` if an explicit opcode
+with the `-start`/`-done` suffixes already exists for that operation. This prevents ambiguity
+and acts as an escape hatch for instructions requiring special HLO-level treatment.
+</Warning>
+
+## Relationship to collective operations
+
+Collective operations like `AllReduce` and `AllGather` are internally decomposed into start/done
+pairs. For example, `AllReduce` becomes `AllReduceStart` and `AllReduceDone`. These internal
+primitives may appear in HLO dumps but are not meant to be constructed manually.
+
+For more on collective operations see [Operation Semantics](/reference/operation-semantics).

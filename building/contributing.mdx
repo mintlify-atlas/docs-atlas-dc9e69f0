@@ -1,0 +1,133 @@
+---
+title: "Contributing to XLA"
+description: "Ways to contribute, CLA requirements, architecture guidelines, code standards, and the review process for XLA."
+---
+
+Everyone can contribute to XLA. This page explains what contributions are accepted, what is required before you begin, and how the review process works.
+
+## Ways to contribute
+
+- Answer questions on the OpenXLA discussion forums (`openxla-discuss`).
+- Improve or expand XLA's documentation.
+- Contribute to XLA's codebase.
+- Contribute to the broader ecosystem of libraries built on XLA.
+
+The OpenXLA project follows [Google's Open Source Community Guidelines](https://opensource.google/conduct/).
+
+## Before you begin
+
+### Sign the Contributor License Agreement
+
+All contributions must be accompanied by a [Contributor License Agreement](https://cla.developers.google.com/about) (CLA). You or your employer retain copyright to your contribution; the CLA gives OpenXLA permission to use and redistribute it as part of the project.
+
+If you or your current employer have already signed the Google CLA for any project, you likely do not need to sign again.
+
+Visit [cla.developers.google.com](https://cla.developers.google.com/) to view your current agreements or sign a new one.
+
+### Review the code of conduct
+
+This project follows [TensorFlow's Code of Conduct](https://github.com/tensorflow/tensorflow/blob/master/CODE_OF_CONDUCT.md).
+
+## Contribution guide
+
+### Optimization passes
+
+Optimization passes execute transformations on the HLO graph to improve computational efficiency. These range from architecture-agnostic, high-level improvements to hardware-specific adjustments (for example, targeting NVIDIA GPUs).
+
+<AccordionGroup>
+  <Accordion title="What we generally accept">
+    Passes that generalize across multiple workloads and demonstrate a clear, significant positive impact on performance benchmarks.
+  </Accordion>
+  <Accordion title="What we generally reject">
+    Passes that perform unique optimizations targeting a specific model. These do not belong in the shared compiler pipeline.
+  </Accordion>
+</AccordionGroup>
+
+### Fusion passes
+
+Fusion is a critical optimization that combines multiple HLO operations into a single kernel to reduce memory I/O and kernel launch overhead.
+
+<Warning>
+  All fusion passes must be added to the **fusion pipeline only** — not before or after it.
+</Warning>
+
+- The pre-optimized HLO module must not contain fusion instructions. Fusion formed early in the pipeline becomes a barrier for optimization passes; fusion formed late prevents backend selection and tuning.
+- Fusion into custom calls (pattern-matching custom calls with producers/consumers and rewriting them into new custom calls) is **not allowed**. Use a proper fusion pass instead.
+
+### Backends and autotuning
+
+Backends for unnested ops — custom calls and fusions — must implement the [`CodegenBackend`](https://github.com/openxla/xla/blob/main/xla/backends/autotuner/codegen_backend.h) interface. This interface enables optimal backend selection by exposing the parameters for a given HLO instruction to the autotuner's search space.
+
+```c++
+// Returns all supported configs for the given HLO instruction.
+virtual absl::StatusOr<std::vector<std::unique_ptr<BackendConfig>>>
+  GetSupportedConfigs(const HloInstruction& instr);
+
+// Returns a default config for the given HLO instruction.
+virtual absl::StatusOr<std::unique_ptr<BackendConfig>> GetDefaultConfig(
+  const HloInstruction& instr);
+```
+
+### Runtime
+
+The end result of the XLA compilation pipeline is a thunk sequence that can be serialized. All new thunk types must be serializable: `GpuCompiler` or `CpuCompiler` must be able to compile the program and serialize it so that an XLA runner can load and execute it later.
+
+<Warning>
+  Thunks must not hold pointers to `HloInstruction`, other compiler state, or `StreamExecutor`. Such pointers make serialization impossible.
+</Warning>
+
+## Code standards
+
+### Coding style
+
+XLA follows [Google's C/C++ Style Guide](https://google.github.io/styleguide/cppguide.html) and [Google's Python Style Guide](https://google.github.io/styleguide/pyguide.html). All submitted code must strictly conform to these guides.
+
+### Compact changes
+
+XLA follows [Google's engineering practices](https://google.github.io/eng-practices/), and in particular the [guide on writing compact changes](https://google.github.io/eng-practices/review/developer/small-cls.html). Smaller, focused changes:
+
+- Are reviewed and merged faster.
+- Reduce the risk of unintentional side effects.
+- Make it easier for reviewers to understand intent.
+
+Even large changes can usually be broken into a series of incremental PRs.
+
+### Test coverage
+
+- All changes must include appropriate unit tests.
+- Tests must not depend on specific hardware (CPU, GPU, etc.) timings.
+- Use mocks and fakes to write deterministic, focused tests.
+- Changes extending code that is currently hard to test should improve its testability.
+- All changes should include benchmark results in the change title so the performance impact is clearly understood.
+
+<Tip>
+  When in doubt about conventions, read pre-existing XLA code and follow the patterns already in place.
+</Tip>
+
+## Review process
+
+All submissions — including those from project members — require review via GitHub pull requests.
+
+- Code must meet all standards above before requesting review. These requirements are not optional.
+- **All tests must pass.** If a test is broken and the failure is unrelated to your changes, contact the maintainers.
+- Avoid scope creep during review. Both submitter and reviewer share responsibility here. If a change grows too large, consider splitting it.
+- Before merging, changes undergo internal testing at Google using internal code and hardware. The Googler reviewing your PR will communicate any internal test failures.
+
+## FAQ
+
+<AccordionGroup>
+  <Accordion title="This infrastructure change seems unrelated to my PR. Why should I do it?">
+    The XLA team does not have a dedicated infrastructure team. Building helper libraries and avoiding technical debt is a regular part of contributing to XLA — everyone is expected to participate. Infrastructure is generally built as needed while writing code.
+
+    If a reviewer asks you to build infrastructure alongside your PR, it likely reflects a difference in expectations about how much supporting work a change requires. This is normal, especially when you're new to the project. Treat infrastructure requests like any other review comment: as an opportunity to learn what is expected here.
+  </Accordion>
+  <Accordion title="Can I address a review comment in a follow-up PR?">
+    In general, no. When a reviewer decides something must be addressed in a given PR, the expectation is that the author addresses it in that PR — even if the requested change is large. This applies to external contributors and Googlers alike.
+
+    There are three main reasons XLA takes this approach:
+
+    - **Trust:** In an open-source project, contributors can appear or disappear at will. After a PR is approved, reviewers have no way to ensure promised follow-ups get done.
+    - **Impact on other developers:** Accepted technical debt affects everyone working in the same area of the codebase until the follow-up lands.
+    - **Reviewer bandwidth:** Deferring work forces reviewers to context-switch back to a PR they've forgotten, and requires them to track outstanding follow-ups — an additional cost on already-overloaded reviewers.
+  </Accordion>
+</AccordionGroup>

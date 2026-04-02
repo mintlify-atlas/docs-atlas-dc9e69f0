@@ -1,0 +1,178 @@
+---
+title: "HLO to Thunks"
+description: "How XLA transforms an HLO module through optimization, scheduling, and buffer assignment into a thunk sequence — the runtime execution plan."
+---
+
+## Overview
+
+This document traces the journey of an XLA HLO module from its initial pre-optimization state to the final compiled executable. The end product of XLA compilation is a **ThunkSequence** — a linear, serializable execution plan consumed by the XLA runtime.
+
+## Pre-Optimization HLO
+
+The pipeline begins with **pre-optimization HLO**. At this stage:
+
+- No XLA-internal operations (`fusion`, `bitcast`) are present.
+- Operations do not yet have layout annotations (or existing layouts are ignored).
+- This HLO is typically produced by JAX, TensorFlow, or PyTorch.
+
+```bash
+# Dump pre-optimization HLO using XLA flags:
+--xla_dump_to=/tmp/xla_dump
+# Look for files with suffix: before_optimizations.txt
+```
+
+## Optimization Passes
+
+The XLA:GPU pipeline transforms pre-optimization HLO into optimized HLO through a sequence of grouped passes:
+
+<Steps>
+  <Step title="Sharding Passes">
+    Includes the [Shardy Partitioner](https://openxla.org/shardy/overview) and SPMD sharding passes. These partition the HLO computation across multiple devices, inserting collective communication operations where needed.
+  </Step>
+  <Step title="Optimization Passes">
+    Legalization and simplification passes. Examples include `AlgebraicSimplifier`, `HloConstantFolding`, and `HloDCE`. See [HLO Optimization Passes](/internals/hlo-passes) for the full list.
+  </Step>
+  <Step title="Collective Optimization Passes">
+    Similar to optimization passes, but focused on collective operations (e.g., `AllReduce`, `AllGather`). Includes passes to overlap communication with computation.
+  </Step>
+  <Step title="Layout Assignment Passes">
+    Assigns a physical memory layout to every HLO operation's output shape. For example:
+
+    ```
+    f32[10,20,30]{2,0,1}
+    ```
+
+    The `{2,0,1}` suffix is the layout permutation in minor-to-major order. The goal is to minimize required physical transpositions. Conflicting layouts are resolved by inserting `copy` operations.
+  </Step>
+  <Step title="Layout Normalization Passes">
+    Rewrites shapes to use the default layout `{rank-1, rank-2, …, 0}`. Converts layout-changing `copy` ops to `transpose` + `bitcast`. The `ReshapeDecomposer` pass turns ambiguous reshapes into explicit `transpose` / `bitcast` sequences.
+  </Step>
+  <Step title="Post-Layout Assignment Optimization">
+    The most important passes here are Triton GEMM and softmax/layernorm fusions, rewrites to cuBLAS/cuDNN library calls, and **autotuning** — where XLA selects between emitters, picks the best convolution algorithm, and finds optimal Triton tiling. See [Persisted Autotuning](/internals/persisted-autotuning).
+  </Step>
+  <Step title="Fusion Passes">
+    **`PriorityFusion`**: Forms fusions guided by the cost model, allowing op duplication when all users can be fused. Can extend existing Triton softmax fusions.
+
+    **`Multi-Output Fusion`**: Fuses ops that share an operand by adding extra outputs, avoiding duplication. Must not introduce cycles.
+
+    After multi-output fusion, `HloCSE` (common subexpression elimination) merges any ops that were duplicated during fusion.
+  </Step>
+  <Step title="Post-Fusion Passes">
+    Final collective-related passes (e.g., turning collectives async, enforcing ordering). Then `CopyInsertion` ensures in-place operations don't overwrite data still needed elsewhere.
+  </Step>
+</Steps>
+
+Optimized HLO is dumped to files with the suffix `after_optimizations.txt`. To dump HLO after intermediate passes:
+
+```bash
+--xla_dump_hlo_pass_re=.*
+```
+
+## Scheduling
+
+After optimization, the HLO module is **scheduled** — a specific topological order is assigned to the operations. The scheduler's primary goal is minimizing peak memory consumption by controlling the lifetimes of intermediate tensors.
+
+The scheduling process:
+1. Tries multiple scheduling algorithms and picks the one with the lowest simulated peak memory usage.
+2. Runs `LatencyHidingScheduler` to maximize compute-communication overlap (at the cost of potentially higher memory).
+3. If peak memory exceeds available device memory, runs `HloRematerialization` to recompute some values rather than keeping them live.
+
+<Warning>
+If rematerialization occurs, investigate reducing memory requirements at the model level (e.g., smaller batch sizes, gradient checkpointing) rather than relying on rematerialization.
+</Warning>
+
+## Buffer Assignment
+
+Immediately before lowering to LLVM IR, XLA runs buffer assignment to map every HLO value to a concrete memory slice:
+
+<Steps>
+  <Step title="HloDataflowAnalysis">
+    Assigns `HloValue` objects (logical buffers) to instructions. In-place operations can reuse an operand's `HloValue`. Tuple outputs define multiple `HloValues`.
+  </Step>
+  <Step title="HloAliasAnalysis">
+    Combines buffers for aliasing operations and computes a mapping from `HloValue` to `HloBuffer`.
+  </Step>
+  <Step title="BufferAssignment">
+    Maps `HloBuffers` to concrete byte slices within a large device buffer, ensuring no two live buffers share the same slice. Allows slight overlap for aliasing ops.
+  </Step>
+</Steps>
+
+```bash
+# Buffer assignment info is dumped with suffix:
+# after_optimizations-buffer-assignment.txt
+```
+
+## Thunks
+
+After scheduling and buffer assignment, the HLO graph is lowered to a **ThunkSequence** — the core of the XLA runtime execution plan.
+
+### What Is a Thunk?
+
+A **Thunk** is a self-contained unit of work that the runtime executes. Examples include:
+
+| Thunk Type | Description |
+|------------|-------------|
+| `KernelThunk` | Launches a compiled GPU kernel |
+| `GemmThunk` | Calls cuBLAS for a matrix multiplication |
+| `ConvolutionThunk` | Calls cuDNN for a convolution |
+| `WhileThunk` | Implements a `while` loop in the HLO |
+| `CommandBufferThunk` | Records and replays a sequence of GPU ops |
+| `CollectiveThunk` | Executes an NCCL collective operation |
+
+A **ThunkSequence** is the complete ordered list of thunks representing the entire program. Each HLO instruction in the entry computation maps to zero, one, or multiple thunks (e.g., `kTuple` and `kConstant` map to zero thunks; a sort instruction may produce multiple).
+
+### Thunk Emission
+
+The process of converting a scheduled HLO computation to thunks is called **thunk emission**:
+
+- **GPU backend**: `IrEmitterUnnested` (`xla/service/gpu/ir_emitter_unnested.h`) iterates through the scheduled HLO instructions and dispatches to specialized `Emit...` methods (`EmitFusion`, `EmitConvolutionThunk`, `EmitWhile`, etc.).
+- **CPU backend**: `ThunkEmitter` (`xla/service/cpu/thunk_emitter.h`) performs the same role.
+
+### Command Buffers: CUDA Graph Optimization
+
+Modern GPUs allow recording a sequence of operations once and replaying them with minimal CPU overhead. XLA uses **Command Buffers** as an abstraction over CUDA Graphs and HIP Graphs.
+
+The `CommandBufferConversionPass` post-processes the ThunkSequence:
+1. Identifies contiguous sub-sequences of compatible thunks (e.g., `KernelThunk`s and `GemmThunk`s).
+2. Replaces them with a single `CommandBufferThunk`.
+3. On first execution, the `CommandBufferThunk` records its commands into a hardware command buffer.
+4. On subsequent executions, it issues a single replay command — avoiding per-kernel CPU launch overhead.
+
+**File:** `xla/backends/gpu/runtime/command_buffer_thunk.h`
+**Conversion pass:** `xla/backends/gpu/runtime/command_buffer_conversion_pass.h`
+**Core interface:** `xla/stream_executor/gpu/gpu_command_buffer.h`
+
+## The Final Executable
+
+The output of the compilation pipeline is an `Executable` object, which encapsulates everything needed to run the compiled program on the target device.
+
+<AccordionGroup>
+  <Accordion title="Compiled Code">
+    Low-level machine code for the device. For CPUs: object files. For GPUs: PTX or HSACO device code, loaded onto the GPU at runtime.
+  </Accordion>
+  <Accordion title="ThunkSequence (Execution Plan)">
+    The ordered list of Thunk objects. The runtime iterates through this sequence to execute the program — launching kernels, calling libraries, handling control flow.
+  </Accordion>
+  <Accordion title="BufferAssignment (Memory Layout)">
+    Complete metadata describing buffer sizes, allocations, and reuse patterns for parameters, outputs, and temporaries. The runtime uses this to allocate device memory and pass correct pointers to each thunk.
+  </Accordion>
+  <Accordion title="HloModule (optional)">
+    A reference to the final optimized `HloModule`, retained for debugging and profiling.
+  </Accordion>
+</AccordionGroup>
+
+The `RunBackend` method of the compiler implementation packages all compiled artifacts into the `Executable`:
+
+- **GPU:** `GpuCompiler` in `xla/service/gpu/gpu_compiler.cc`
+- **CPU:** `CpuCompiler` in `xla/service/cpu/cpu_compiler.cc`
+
+Modern runtimes use `PjRtExecutable` (`xla/pjrt/pjrt_executable.h`), which wraps the backend-specific `Executable` and exposes it through the PJRT API.
+
+```
+Execute() call
+  └─ BufferAssignment → allocate device memory
+  └─ ThunkSequence → launch operations on device
+      ├─ KernelThunk → GPU kernel launch
+      ├─ GemmThunk   → cuBLAS call
+      └─ ...
+```

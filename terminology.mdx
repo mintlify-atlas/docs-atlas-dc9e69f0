@@ -1,0 +1,88 @@
+---
+title: "XLA Terminology"
+description: "Definitions for key terms used in XLA, MLIR, LLVM, and related technologies in the OpenXLA ecosystem."
+---
+
+This page defines terms you'll encounter when working with XLA and the broader OpenXLA ecosystem. Where a term has a dedicated reference page, it is linked below.
+
+<AccordionGroup>
+  <Accordion title="OpenXLA">
+    OpenXLA is an open ecosystem of performant, portable, and extensible machine learning (ML) infrastructure components that simplify ML development by defragmenting the tools between frontend frameworks and hardware backends.
+
+    It includes XLA, StableHLO, VHLO, [PJRT](/reference/pjrt/overview), and other components.
+  </Accordion>
+
+  <Accordion title="XLA (Accelerated Linear Algebra)">
+    XLA is an open-source compiler for machine learning. It takes models from popular frameworks such as PyTorch, TensorFlow, and JAX, and optimizes them for high-performance execution across different hardware platforms including GPUs, CPUs, and ML accelerators.
+
+    The XLA compiler outputs code to LLVM, to "standard" MLIR, and to [Triton MLIR](https://triton-lang.org/main/dialects/dialects.html) that is processed by the (MLIR-based) OpenAI Triton compiler.
+
+    See [Introduction to XLA](/introduction) and [XLA Architecture](/architecture).
+  </Accordion>
+
+  <Accordion title="PJRT">
+    [PJRT](https://github.com/openxla/xla/blob/main/xla/pjrt/c/pjrt_c_api.h) is a uniform Device API that simplifies the growing complexity of ML workload execution across hardware and frameworks. It provides a hardware- and framework-independent interface for compilers and runtimes.
+
+    See [PJRT API overview](/reference/pjrt/overview).
+  </Accordion>
+
+  <Accordion title="StableHLO">
+    StableHLO is the public interface to OpenXLA. It is a standardized MLIR dialect that may be used by different frameworks and compilers in the OpenXLA ecosystem.
+
+    XLA supports StableHLO and immediately converts it to HLO on input. There are [StableHLO-to-StableHLO passes](https://openxla.org/stablehlo/generated/stablehlo_passes) implemented using the MLIR framework. It is also possible to convert StableHLO to other compilers' IR without using HLO, for example in cases where an existing IR is more appropriate.
+  </Accordion>
+
+  <Accordion title="CHLO">
+    CHLO is a collection of higher-level operations which are optionally decomposable to StableHLO. It sits above StableHLO in the abstraction hierarchy.
+  </Accordion>
+
+  <Accordion title="VHLO">
+    The [VHLO Dialect](https://openxla.org/stablehlo/vhlo) is an MLIR dialect that serves as a compatibility layer on top of StableHLO. It provides a snapshot of the StableHLO dialect at a given point in time by versioning individual program elements, and is used for serialization and stability.
+  </Accordion>
+
+  <Accordion title="MHLO">
+    MHLO is a standalone MLIR-based representation of XLA's HLO IR. The dialect is being evaluated for deprecation. New users should prefer StableHLO instead.
+  </Accordion>
+
+  <Accordion title="HLO (High Level Optimizer)">
+    HLO is the internal graph representation (IR) for the XLA compiler (and also a supported input format). Unlike StableHLO and CHLO, HLO is **not** based on MLIR — it has its own textual syntax and binary (protobuf-based) representation.
+
+    See [XLA Architecture](/architecture) for how HLO fits into the compilation pipeline.
+  </Accordion>
+
+  <Accordion title="HLO pass">
+    An HLO pass is a transformation or analysis applied to the HLO graph during compilation. Passes may be target-independent (such as CSE and operation fusion) or backend-specific (such as GPU stream partitioning). Passes run in sequence and progressively optimize the HLO module.
+
+    See [HLO passes](/internals/hlo-passes).
+  </Accordion>
+
+  <Accordion title="Thunk">
+    A thunk represents a single unit of work in the runtime execution plan (`ThunkSequence`) produced by XLA compilation. Examples include launching a GPU kernel, calling a library function such as cuBLAS, or handling control flow.
+
+    The runtime executes the compiled program by iterating through the `ThunkSequence`. Each thunk receives the correct memory pointers via `BufferAssignment`.
+
+    See [HLO to thunks](/internals/hlo-to-thunks).
+  </Accordion>
+
+  <Accordion title="Emitter">
+    An emitter is responsible for converting scheduled HLO computations into a thunk sequence or low-level IR. In XLA:GPU there are multiple emitter types — including loop, transpose, and reduction emitters — each suited to different fusion patterns. The loop emitter is the default when no specialized emitter applies.
+
+    See [Emitters](/internals/emitters).
+  </Accordion>
+
+  <Accordion title="MLIR">
+    [MLIR](https://mlir.llvm.org) (Multi-Level Intermediate Representation) is a hybrid IR infrastructure that allows users to define "dialects" of operations at varying degrees of abstraction, and gradually lower between these operation sets, performing transformations at each level of granularity.
+
+    StableHLO, CHLO, and VHLO are all examples of MLIR dialects used in the OpenXLA ecosystem.
+  </Accordion>
+
+  <Accordion title="LLVM">
+    [LLVM](https://llvm.org/) is a compiler backend and the IR language it takes as input. Many compilers — including XLA — generate LLVM IR as an intermediate step, after which LLVM generates native machine code.
+
+    This allows developers to reuse optimization logic across compilers and makes supporting different target platforms easier. XLA's GPU and CPU backends have [LLVM IR emitters](https://github.com/openxla/xla/tree/main/xla/service/llvm_ir) for targeting specific hardware.
+  </Accordion>
+
+  <Accordion title="Triton">
+    [Triton](https://triton-lang.org/) is an MLIR-based compiler developed by OpenAI for GPU kernel generation. XLA can emit Triton MLIR as part of its code generation path, which is then processed by the Triton compiler to produce GPU kernels.
+  </Accordion>
+</AccordionGroup>

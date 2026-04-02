@@ -1,0 +1,219 @@
+---
+title: "HLO Dumps"
+description: "Generate and read HLO computation dumps at different stages of the XLA optimization pipeline for debugging and bug reports."
+keywords: ["HLO", "dump", "debugging", "XLA_FLAGS", "hlo-opt", "optimization", "compiler"]
+---
+
+HLO (High-Level Operations) dumps are textual or binary representations of your XLA computation at different stages of the compiler pipeline. They are essential for debugging performance issues, verifying correctness, and filing XLA bug reports.
+
+## Dump formats
+
+XLA can emit HLO in several formats depending on your needs:
+
+<AccordionGroup>
+  <Accordion title="Text (default)">
+    Human-readable representation of HLO instructions and their properties. Best for reading and diffing.
+  </Accordion>
+  <Accordion title="HloProto">
+    Protocol buffer format — structured and machine-readable. Required for tools that consume binary HLO.
+  </Accordion>
+  <Accordion title="HloSnapshot">
+    HLO module plus its live input data. Use this when you need to replay a computation with the exact inputs rather than synthetic fake data.
+  </Accordion>
+  <Accordion title="HTML / URL (graphviz)">
+    Visual graph rendering. Only practical for small graphs; use `interactive_graphviz` for large ones.
+  </Accordion>
+</AccordionGroup>
+
+## Generating dumps
+
+### Using `XLA_FLAGS`
+
+Set the `XLA_FLAGS` environment variable before running your program. This works for JAX, TensorFlow, and PyTorch/XLA.
+
+```sh
+XLA_FLAGS="--xla_dump_to=/tmp/myfolder" ./my-program
+```
+
+By default this dumps HLO as text at the start and end of the optimization pipeline (before and after optimizations).
+
+<Note>
+  If `--xla_dump_to` is not specified but another dump flag is set, output goes to stdout. Binary formats such as proto files are never written to stdout.
+</Note>
+
+### Specifying the format explicitly
+
+<CodeGroup>
+
+```sh text
+XLA_FLAGS="--xla_dump_hlo_as_text --xla_dump_to=/tmp/myfolder" ./my-program
+```
+
+```sh proto
+XLA_FLAGS="--xla_dump_hlo_as_proto --xla_dump_to=/tmp/myfolder" ./my-program
+```
+
+```sh snapshots
+XLA_FLAGS="--xla_dump_hlo_snapshots --xla_dump_to=/tmp/myfolder" ./my-program
+```
+
+```sh html
+XLA_FLAGS="--xla_dump_hlo_as_html --xla_dump_to=/tmp/myfolder" ./my-program
+```
+
+```sh url (graphviz)
+XLA_FLAGS="--xla_dump_hlo_as_url --xla_dump_to=/tmp/myfolder" ./my-program
+```
+
+</CodeGroup>
+
+### Dumping specific intermediate passes
+
+You can dump HLO after any subset of compiler passes using a regular expression:
+
+```sh
+XLA_FLAGS="--xla_dump_hlo_pass_re=spmd|propagation --xla_dump_to=/tmp/myfolder" ./my-program
+```
+
+To dump after every pass (produces many files):
+
+```sh
+XLA_FLAGS="--xla_dump_hlo_pass_re=.* --xla_dump_to=/tmp/myfolder" ./my-program
+```
+
+## JAX-specific options
+
+### Programmatic dump (pre-optimized)
+
+```python
+jax.jit(f).lower(*args).as_text('hlo')
+```
+
+### Programmatic dump with pass filtering
+
+```python
+compilation_args = {
+    'xla_dump_to': '/tmp/myfolder',
+    'xla_dump_hlo_pass_re': 'spmd|propagation',
+}
+
+jax.jit(f).lower(*args).compile(compilation_args)
+```
+
+### Interactive HLO in Colab / notebooks
+
+Set the environment variable in the **first executed cell**, before XLA initializes:
+
+```python
+import os
+os.environ['XLA_FLAGS'] = '--xla_dump_to=/tmp/myfolder'
+```
+
+Print pre-optimized HLO inline:
+
+```python
+def f(x):
+    return jax.numpy.sin(jax.numpy.cos(x))
+
+c = jax.jit(f).lower(3.).compiler_ir('hlo')
+print(c.as_hlo_text())
+```
+
+Print optimized HLO inline:
+
+```python
+def optimized_hlo(f, *args):
+    print(jax.jit(f).lower(*args).compile().as_text())
+
+def f(x):
+    return jax.numpy.sin(jax.numpy.cos(x))
+
+optimized_hlo(f, 1.0)
+```
+
+To include all small compilations:
+
+```sh
+JAX_COMPILER_DETAILED_LOGGING_MIN_OPS=0
+```
+
+### Dumping jaxprs
+
+```sh
+JAX_DUMP_IR_TO="/tmp/myfolder" JAX_DUMP_IR_MODES=jaxpr
+```
+
+### Mosaic (TPU / experimental GPU)
+
+```sh
+--xla_mosaic_dump_to=/tmp/mosaic_dumps
+```
+
+Or via the TPU init arguments environment variable:
+
+```sh
+export LIBTPU_INIT_ARGS="--xla_mosaic_dump_to=/tmp/mosaic_dumps"
+```
+
+## Reading HLO dumps
+
+Dump files are named with the framework computation name, a sequence number, and the pipeline stage:
+
+```
+1624325116260738.module_0065.pmap__unnamed_wrapped_function_.186875.before_optimizations.txt
+```
+
+The `before_optimizations.txt` suffix means this is the HLO as it entered the XLA optimization pipeline. A corresponding `after_optimizations.txt` file shows the final output.
+
+Use `ripgrep` to find a specific operation or symbol across many dump files:
+
+```sh
+rg "my_operation_name" /tmp/myfolder/
+```
+
+<Tip>
+  When filing a bug report, include the three files: `before_optimizations.txt`, `after_optimizations.txt`, and the buffer assignment file.
+</Tip>
+
+## Using `hlo-opt` for format conversion
+
+The `hlo-opt` tool converts between HloProto and text format:
+
+```sh
+# Convert proto to text
+hlo-opt --input_format=proto --output_format=text module.pb > module.txt
+
+# Convert text to proto
+hlo-opt --input_format=text --output_format=proto module.txt > module.pb
+```
+
+See the [XLA tooling reference](/reference/tools) for full `hlo-opt` usage.
+
+## Replaying dumps
+
+You can replay a dumped computation against a specific XLA backend with fake data or real input snapshots. This lets you reproduce and iterate on issues without running the full program.
+
+<Steps>
+  <Step title="Dump the computation">
+    Run your program with `--xla_dump_hlo_snapshots` (to capture real inputs) or `--xla_dump_hlo_as_text` (to use fake data on replay).
+  </Step>
+  <Step title="Replay on CPU">
+    ```sh
+    bazel run -c opt //xla/hlo/tools:run_hlo_module -- --platform=cpu \
+      /tmp/myfolder/module_4561.before_optimizations.txt
+    ```
+  </Step>
+  <Step title="Replay on GPU">
+    ```sh
+    bazel run -c opt //xla/hlo/tools:run_hlo_module -- --platform=CUDA \
+      /tmp/myfolder/module_4561.before_optimizations.txt
+    ```
+  </Step>
+</Steps>
+
+To force fake data even when a snapshot is provided:
+
+```sh
+bazel run -c opt //xla/hlo/tools:run_hlo_module -- --platform=CUDA \
+  --force_fake_data /tmp/myfolder/module_4561.hlo_snapshot.pb
+```

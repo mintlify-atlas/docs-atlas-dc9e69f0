@@ -1,28 +1,11 @@
 {
-  "$schema": "https://mintlify.com/docs.json",
-  "name": "XLA (Accelerated Linear Algebra)",
+  "projectType": "ai-ml",
+  "projectName": "XLA (Accelerated Linear Algebra)",
+  "projectDescription": "An open-source machine learning compiler that optimizes models from PyTorch, TensorFlow, and JAX for high-performance execution across GPUs, CPUs, and ML accelerators.",
   "theme": "aspen",
-  "colors": {
-    "primary": "#14243c",
-    "light": "#5fabde",
-    "dark": "#d1d4d8"
-  },
-  "favicon": "https://media.brand.dev/993685ab-017a-4cd6-9edd-dc3132b80b32.png",
-  "logo": {
-    "light": "https://media.brand.dev/296b35a5-9126-4a5e-ae4d-d2761e320586.svg",
-    "dark": "https://media.brand.dev/296b35a5-9126-4a5e-ae4d-d2761e320586.svg"
-  },
-  "navbar": {
-    "primary": {
-      "type": "github",
-      "href": "https://github.com/openxla/xla"
-    }
-  },
-  "footer": {
-    "socials": {
-      "github": "https://github.com/openxla/xla"
-    }
-  },
+  "primaryColor": "#14243c",
+  "lightColor": "#5fabde",
+  "darkColor": "#d1d4d8",
   "navigation": {
     "tabs": [
       {
@@ -112,5 +95,29 @@
         ]
       }
     ]
-  }
+  },
+  "keyFeatures": [
+    "Multi-framework support: integrates with PyTorch, TensorFlow, and JAX via StableHLO",
+    "Cross-platform execution: targets GPUs (NVIDIA, AMD), CPUs, and custom ML accelerators",
+    "Automated optimization passes: hundreds of HLO passes including fusion, algebraic simplification, and rematerialization",
+    "PJRT uniform device API: hardware-agnostic runtime interface for ML frameworks",
+    "XLA FFI custom calls: stable ABI for integrating external kernels and libraries",
+    "Pluggable backend architecture: extensible compiler for new hardware targets",
+    "Megascale distributed training: multi-host SPMD support for large model parallelism",
+    "Triton and LLVM code generation: high-performance GPU and CPU kernel generation"
+  ],
+  "publicApiSurface": [
+    "XlaBuilder — high-level op construction API (xla/hlo/builder/xla_builder.h)",
+    "XlaOp — handle for HLO operations in the builder",
+    "PjRtClient — uniform device API for compilation and execution (xla/pjrt/pjrt_client.h)",
+    "PjRtDevice — hardware device abstraction",
+    "PjRtExecutable — compiled program ready for execution",
+    "XLA FFI (xla/ffi/) — foreign function interface for custom calls",
+    "HloModulePass — base class for HLO optimization passes (xla/hlo/pass/hlo_pass_interface.h)",
+    "xla::Compiler — backend compiler interface (xla/service/compiler.h)",
+    "StableHLO — public input IR (versioned MLIR dialect)",
+    "run_hlo_module — CLI tool to run and test HLO modules",
+    "hlo-opt — CLI tool for running individual HLO passes",
+    "multihost_hlo_runner — CLI tool for SPMD multi-host HLO execution"
+  ]
 }

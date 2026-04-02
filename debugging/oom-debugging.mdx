@@ -1,0 +1,151 @@
+---
+title: "Debugging Out-of-Memory (OOM) Errors"
+description: "Identify and resolve out-of-memory errors in XLA using XProf's Memory Viewer and targeted debugging strategies."
+keywords: ["OOM", "out of memory", "HBM", "VMEM", "memory", "XProf", "memory viewer", "debugging", "RESOURCE_EXHAUSTED"]
+---
+
+Out-of-memory (OOM) errors occur when an accelerator's memory capacity is exhausted during compilation or execution. XLA reports these as `RESOURCE_EXHAUSTED` status errors.
+
+## Types of OOM errors
+
+<AccordionGroup>
+  <Accordion title="HBM OOM (E1000) — compile time">
+    High Bandwidth Memory exhaustion during compilation. The compiler cannot fit all buffers into the device's HBM capacity.
+
+    ```
+    XlaRuntimeError: RESOURCE_EXHAUSTED: XLA:TPU compile permanent error.
+    Ran out of memory in memory space hbm. Used 49.34G of 32.00G hbm.
+    Exceeded hbm capacity by 17.34G.
+    Total hbm usage >= 49.34G: reserved 3.12M program unknown size arguments 49.34G
+    ```
+
+    See [Errors Overview](/debugging/errors-overview) for detailed causes and fixes.
+  </Accordion>
+  <Accordion title="VMEM OOM (E1001) — compile time">
+    Vector memory exhaustion on TPUs during kernel allocation.
+
+    ```
+    JaxRuntimeError: RESOURCE_EXHAUSTED: Ran out of memory in memory space vmem
+    while allocating on stack for %ragged_latency_optimized_all_gather_...
+    ```
+
+    See [Errors Overview](/debugging/errors-overview) for VMEM OOM details.
+  </Accordion>
+  <Accordion title="GPU runtime OOM">
+    Memory exhaustion at runtime on GPU devices:
+
+    ```
+    XlaRuntimeError: RESOURCE_EXHAUSTED: Out of memory while trying to allocate 214748364800 bytes.
+    ```
+  </Accordion>
+  <Accordion title="Allocation failure (E0100 / E0101)">
+    Runtime buffer or program allocation failures. See [Errors Overview](/debugging/errors-overview) for error categories.
+  </Accordion>
+</AccordionGroup>
+
+## Reproducing an OOM
+
+The following JAX program reliably triggers an HBM OOM on a TPU:
+
+```python
+import jax
+from jax import random
+import jax.numpy as jnp
+
+
+@jax.profiler.trace("/tmp/xprof")
+@jax.jit
+def oom():
+    a = random.normal(random.PRNGKey(1), (327680, 327680), dtype=jnp.bfloat16)
+    return a @ a
+
+
+if __name__ == "__main__":
+    oom()
+```
+
+<Note>
+  Use `jax.profiler.trace` rather than `start_trace`/`stop_trace`. The context manager is exception-safe, so the profile is written even when the program crashes with an OOM.
+</Note>
+
+## Debugging with XProf Memory Viewer
+
+XProf's Memory Viewer visualizes per-op buffer allocations and pinpoints the peak memory moment.
+
+<Steps>
+  <Step title="Capture a profile">
+    Wrap your computation with `jax.profiler.trace` as shown in the example above. Profiles are written to the directory you specify.
+  </Step>
+  <Step title="Start XProf">
+    ```sh
+    pip install xprof
+    xprof --logdir=/tmp/xprof/ --port=6006
+    ```
+  </Step>
+  <Step title="Open Memory Viewer">
+    Navigate to `http://localhost:6006`. In the **Tools** dropdown select **Memory Viewer**, then choose **HBM** in the **Memory Types** dropdown.
+  </Step>
+  <Step title="Analyze peak allocation">
+    Focus on the **HLO Ops at Peak Memory Allocation** section. This shows three buffer charts at the moment of highest memory usage, broken down into:
+
+    - **Program inputs and outputs** — training batches, optimizer states
+    - **TensorCore and SparseCore temporaries** — activations, gradients, intermediate tensors
+
+    Hover over chart segments to see op name, shape, size, and allocation type.
+  </Step>
+</Steps>
+
+## What to look for
+
+After opening the peak allocation view, look for:
+
+- **Large intermediate tensors** with shapes that could be reduced by lowering batch size or sequence length.
+- **Inefficient padding** — large tensors whose padded shape is significantly larger than their logical shape.
+- **Long-lived temporaries** — buffers that are allocated early and held until late in the computation, preventing reuse.
+
+## Common mitigation strategies
+
+<AccordionGroup>
+  <Accordion title="Reduce batch size or tensor dimensions">
+    The most direct fix. Cut the batch size or model dimension until the program fits, then use gradient accumulation to recover effective batch size.
+  </Accordion>
+  <Accordion title="Enable rematerialization (gradient checkpointing)">
+    Recompute activations during the backward pass instead of storing them. In JAX:
+
+    ```python
+    from jax import checkpoint
+
+    @checkpoint
+    def forward(x):
+        ...
+    ```
+  </Accordion>
+  <Accordion title="Reduce model precision">
+    Switch from `float32` to `bfloat16` or `float16` to halve activation and weight memory.
+  </Accordion>
+  <Accordion title="Use persisted autotuning">
+    Autotuning itself allocates scratch buffers. Run autotuning once and persist the results so subsequent runs skip it:
+
+    ```sh
+    --xla_gpu_require_complete_aot_autotune_results
+    ```
+
+    See [Persisted Autotuning](/internals/persisted-autotuning) for setup instructions.
+  </Accordion>
+  <Accordion title="Inspect HLO buffer assignment">
+    Dump HLO with buffer assignments to see exactly which buffers are allocated and when:
+
+    ```sh
+    XLA_FLAGS="--xla_dump_to=/tmp/myfolder" ./my-program
+    ```
+
+    Look at the `buffer_assignment` section of the dump for live-range and size information.
+  </Accordion>
+</AccordionGroup>
+
+## Further reading
+
+- [Errors Overview](/debugging/errors-overview)
+- [XProf Memory Viewer documentation](https://openxla.org/xprof/memory_viewer)
+- [JAX GPU memory allocation guide](https://docs.jax.dev/en/latest/gpu_memory_allocation.html)
+- [HLO Dumps](/debugging/hlo-dumps)

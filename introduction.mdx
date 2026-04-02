@@ -1,0 +1,41 @@
+---
+title: "Introduction to XLA"
+description: "XLA (Accelerated Linear Algebra) is an open-source ML compiler that optimizes models from PyTorch, TensorFlow, and JAX for high-performance execution across GPUs, CPUs, and ML accelerators."
+---
+
+<Note>
+  This documentation is intended for **XLA contributors** and **XLA integrators** who want to develop the compiler or add support for ML frontends and hardware backends. If you want to use XLA to compile your ML models, refer to the documentation for your framework: [PyTorch](https://pytorch.org/xla), [TensorFlow](https://www.tensorflow.org/xla), or [JAX](https://jax.readthedocs.io/en/latest/notebooks/quickstart.html).
+</Note>
+
+XLA (Accelerated Linear Algebra) is an open-source compiler for machine learning. It takes models from popular frameworks such as PyTorch, TensorFlow, and JAX, and optimizes them for high-performance execution across different hardware platforms including GPUs, CPUs, and ML accelerators.
+
+XLA is part of the [OpenXLA](https://openxla.org/) project, built collaboratively by industry-leading ML hardware and software companies: Alibaba, Amazon Web Services, AMD, Apple, Arm, Google, Intel, Meta, and NVIDIA.
+
+## Key benefits
+
+- **Build anywhere**: XLA is already integrated into leading ML frameworks such as TensorFlow, PyTorch, and JAX.
+
+- **Run anywhere**: It supports various backends including GPUs, CPUs, and ML accelerators, and includes a pluggable infrastructure to add support for more.
+
+- **Maximize and scale performance**: It optimizes a model's performance with production-tested optimization passes and automated partitioning for model parallelism.
+
+- **Eliminate complexity**: It leverages [MLIR](https://mlir.llvm.org/) to bring the best capabilities into a single compiler toolchain, so you don't have to manage a range of domain-specific compilers.
+
+- **Future ready**: As an open-source project built through collaboration of leading ML hardware and software vendors, XLA is designed to operate at the cutting edge of the ML industry.
+
+## Explore the docs
+
+<CardGroup cols={2}>
+  <Card title="XLA Architecture" icon="sitemap" href="/architecture">
+    Understand the compilation pipeline, from StableHLO input through optimization passes to target-specific machine code.
+  </Card>
+  <Card title="Developer Guide" icon="code" href="/developer-guide">
+    Get the source code, set up your build environment, and submit your first pull request.
+  </Card>
+  <Card title="PJRT API" icon="plug" href="/reference/pjrt/overview">
+    Learn about the uniform Device API that simplifies ML workload execution across hardware and frameworks.
+  </Card>
+  <Card title="Operation Semantics" icon="book" href="/reference/operation-semantics">
+    Reference documentation for all XLA operations and their semantics.
+  </Card>
+</CardGroup>

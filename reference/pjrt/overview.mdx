@@ -1,0 +1,108 @@
+---
+title: "PJRT Overview"
+description: "PJRT is the uniform Device API for the ML ecosystem, enabling frameworks to call device-specific implementations through a stable interface."
+keywords: ["PJRT", "device API", "plugin", "JAX", "XLA", "accelerator"]
+---
+
+PJRT (Pretty-much Just an R-T?) is the uniform Device API designed for the ML ecosystem.
+
+## Vision
+
+<CardGroup cols={2}>
+  <Card title="Frameworks call PJRT" icon="layers">
+    Frameworks like TensorFlow, JAX, and others call PJRT, which has device-specific
+    implementations that are opaque to the frameworks.
+  </Card>
+  <Card title="Devices implement PJRT" icon="cpu">
+    Each device (GPU, TPU, custom accelerator) focuses on implementing PJRT APIs as
+    PJRT plugins, which can be opaque to the frameworks.
+  </Card>
+</CardGroup>
+
+PJRT offers both a **C API** and a **C++ API**. Plugging in at either layer is supported:
+
+- The **C API** provides a stable ABI for plugins that want full isolation from XLA internals
+- The **C++ API** offers convenient abstractions but has stronger ties to XLA datatypes
+
+## Communication channels
+
+<CardGroup cols={2}>
+  <Card title="GitHub Issues" icon="github" href="https://github.com/openxla/xla">
+    File issues and feature requests in the OpenXLA/xla repository.
+  </Card>
+  <Card title="OpenXLA Discord" icon="message-circle" href="https://discord.gg/ZKXq7b3V8A">
+    Ask questions about PJRT on the OpenXLA Discord server.
+  </Card>
+</CardGroup>
+
+## Key resources
+
+<CardGroup cols={2}>
+  <Card title="PJRT C API header" icon="code" href="https://github.com/openxla/xla/blob/main/xla/pjrt/c/pjrt_c_api.h">
+    The primary C API header defining all PJRT interfaces.
+  </Card>
+  <Card title="C API changelog" icon="list" href="https://github.com/openxla/xla/blob/main/xla/pjrt/c/CHANGELOG.md">
+    Track breaking changes and additions to the PJRT C API.
+  </Card>
+  <Card title="Integration guide" icon="book-open" href="https://github.com/openxla/xla/blob/main/xla/pjrt/c/docs/pjrt_integration_guide.md">
+    Step-by-step guide for integrating a new device with PJRT.
+  </Card>
+  <Card title="PJRT Examples" icon="play" href="/reference/pjrt/examples">
+    Real examples of PJRT plugins and framework integrations.
+  </Card>
+</CardGroup>
+
+## ABI versioning and compatibility
+
+PJRT uses a versioning scheme to ensure compatibility between frameworks and plugins
+compiled at different times.
+
+<Note>
+See the [PJRT API ABI versioning and compatibility](https://docs.google.com/document/d/1TKB5NyGtdzrpgw5mpyFjVAhJjpSNdF31T6pjPl_UT2o/edit)
+design doc for the full specification.
+</Note>
+
+When using the PJRT C API, the framework and plugin communicate their supported API versions
+at load time. The lower of the two supported versions is used for communication, ensuring
+backward compatibility as the API evolves.
+
+Key points:
+- Plugins compiled against older versions of the C API continue to work with newer frameworks
+- Frameworks can discover which optional features a plugin supports through the `PJRT_Plugin_Attributes` API
+- The C API changelog documents every breaking change and its version
+
+## PJRT components
+
+The PJRT C++ API is organized around five main abstractions:
+
+| Component | Description |
+| --------- | ----------- |
+| `PjRtClient` | Manages all communication between device and framework; owns devices and memory spaces |
+| `PjRtDevice` | Describes a single physical device, its kind, and its location in a device grid |
+| `PjRtMemorySpace` | Describes a memory location (pinned or unpinned) accessible from devices |
+| `PjRtBuffer` | Holds data on a device in a plugin-native format |
+| `PjRtLoadedExecutable` | An in-memory compiled executable ready for execution |
+
+For full API details see the [PJRT C++ API reference](/reference/pjrt/cpp-api).
+
+## Plugin discovery
+
+Plugins are loaded by frameworks using platform-specific mechanisms. For JAX:
+
+<Steps>
+  <Step title="Implement the C API">
+    Implement the PJRT C API directly, or wrap a C++ `PjRtClient` using the provided wrapper.
+  </Step>
+  <Step title="Expose GetPjRtApi">
+    Export a `GetPjRtApi()` function returning a `PJRT_Api*` with function pointers to your implementations.
+  </Step>
+  <Step title="Register with the framework">
+    For JAX, place your plugin under the `jax_plugins` namespace package, or advertise it
+    via package entry points under the `jax_plugins` group.
+  </Step>
+  <Step title="Initialize the plugin">
+    Implement `initialize()` in your Python module to call `xla_bridge.register_plugin(...)`.
+  </Step>
+</Steps>
+
+For a complete integration walkthrough see the [integration guide](/reference/pjrt/examples).

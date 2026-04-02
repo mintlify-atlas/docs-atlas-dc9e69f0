@@ -1,0 +1,315 @@
+---
+title: "XLA:GPU Code Emitters"
+description: "How XLA:GPU generates GPU kernel code through external libraries, Triton IR, and native LLVM emitters."
+---
+
+## Overview
+
+XLA:GPU has three strategies for generating code from HLO:
+
+<CardGroup cols={3}>
+  <Card title="External Libraries" icon="layer-group">
+    Replace HLO with custom calls to NVIDIA cuBLAS and cuDNN. Fast, verified, but limits fusion.
+  </Card>
+  <Card title="Triton IR" icon="bolt">
+    Tile HLO to block level and use OpenAI Triton for PTX generation. Best for matmul and softmax fusions.
+  </Card>
+  <Card title="XLA Emitters" icon="code">
+    Progressively lower HLO to LLVM IR via MLIR dialects. Used for reductions, transposes, and elementwise ops.
+  </Card>
+</CardGroup>
+
+This page focuses on **XLA Emitters** — the native code generation path.
+
+## Hero-Based Codegen
+
+XLA:GPU has 7 emitter types. Each corresponds to a **hero** — the most important operation in an HLO fusion that determines the code generation strategy for the entire fusion.
+
+<AccordionGroup>
+  <Accordion title="Loop Emitter (default)">
+    The fallback emitter used when no specialized hero is present. Generates a simple loop that traverses all output elements linearly, guaranteeing coalesced memory writes.
+
+    **File:** `xla/backends/gpu/codegen/emitters/loop.h`
+  </Accordion>
+  <Accordion title="Transpose Emitter">
+    Selected when the fusion contains an `HloTransposeInstruction` that requires shared memory to improve memory access patterns. Uses two loop nests with a shared memory staging buffer and thread barrier.
+  </Accordion>
+  <Accordion title="Reduction Emitter">
+    Generates reductions using warp shuffles and shared memory. Selected when the hero op is a reduce instruction.
+  </Accordion>
+  <Accordion title="Scatter Emitter">
+    Handles scatter operations, which write to non-contiguous output locations.
+  </Accordion>
+  <Accordion title="Gather Emitter">
+    Handles canonical gather operations as produced by `gather_simplifier`.
+  </Accordion>
+  <Accordion title="Copy Emitter">
+    Handles explicit buffer copies, often inserted by layout assignment.
+  </Accordion>
+  <Accordion title="Custom Fusion Emitter">
+    A specialized emitter for fusions tagged with a custom backend config.
+  </Accordion>
+</AccordionGroup>
+
+## High-Level Architecture
+
+The emitter pipeline consists of three stages:
+
+<Steps>
+  <Step title="Computation Partitioner">
+    Splits an HLO fusion computation into sub-functions that can each be emitted safely.
+  </Step>
+  <Step title="Emitters">
+    Converts each partitioned sub-graph to MLIR using `xla_gpu`, `tensor`, `arith`, `math`, and `scf` dialects.
+  </Step>
+  <Step title="Compilation Pipeline">
+    Optimizes and lowers the MLIR IR through a sequence of passes down to LLVM IR.
+  </Step>
+</Steps>
+
+## Computation Partitioning
+
+**File:** `xla/codegen/emitters/computation_partitioner.h`
+
+Non-elementwise HLO instructions cannot always be emitted together in a single function. Consider:
+
+```
+     param
+       |
+      log
+      |  \
+      |  transpose
+      |  /
+      add
+```
+
+Here, `log` is accessed at two different indices for each element of `add` — once directly and once after transposition. If emitted naively in a single function, this causes exponential code growth when multiple splits occur.
+
+The partitioner splits the graph into functions using these rules:
+
+- Instructions with **only one user** are safe to emit together with their user.
+- Instructions with **multiple users** are safe to emit together if all users access them through the same indices.
+
+In the example above, `add` and `transpose` access different indices of `log`, so `log` is placed in its own function. The graph becomes three separate functions.
+
+## Elemental Emission
+
+**File:** `xla/codegen/emitters/elemental_hlo_to_mlir.h`
+
+Elemental emission creates loops and arithmetic ops for HLO instructions. For pure index-transformation operations (`transpose`, `broadcast`, `reshape`, `slice`, `reverse`), XLA's indexing analysis produces an output-to-input index mapping that the emitter applies directly.
+
+For example, a `transpose` from `[20, 40]` to `[40, 20]` produces this mapping (d0, d1 are output dimensions):
+
+```
+  (d0, d1) -> d1
+  (d0, d1) -> d0
+```
+
+The emitter applies this map and reads the input at the resulting index.
+
+<Note>
+Internal `tuple` ops and nested tuple outputs are not supported. All XLA graphs that use these features must be converted to non-tuple form before reaching the emitter.
+</Note>
+
+## Subgraph Function Signatures
+
+For a subgraph with parameters `%p0` to `%pn` and root dimensions `r`, the MLIR function signature is:
+
+```mlir
+(%p0: tensor<...>, ..., %pn: tensor<...>,
+ %i0: index, ..., %i_{r-1}: index) -> (e0, ..., em)
+```
+
+One tensor per computation parameter, one index per output dimension, one result per output.
+
+## Entry Function
+
+Each emitter type generates a different **entry function** for the hero op. The entry function takes only thread and block IDs as inputs (no indices) and writes to output buffers:
+
+```mlir
+(%p0: tensor<...>, ..., %pn: tensor<...>,
+ %r0: tensor<...>, ..., %rn: tensor<...>) -> (tensor<...>, ..., tensor<...>)
+```
+
+The entry function `tensor.insert`s computed values into output tensors and returns them.
+
+## Compilation Pipeline: Loop Emitter Example
+
+To illustrate the pipeline, consider the GELU activation function, which consists entirely of elementwise ops, constants, and broadcasts. It uses the loop emitter.
+
+### Step 1: MLIR Conversion
+
+After conversion to MLIR, the computation becomes an `xla_gpu.loop` driven by `%thread_id_x` and `%block_id_x`:
+
+```mlir
+func.func @main(%input: tensor<6x512x4096xbf16>, %output: tensor<6x512x4096xbf16>)
+    -> tensor<6x512x4096xbf16> {
+  %thread_id_x = gpu.thread_id x {xla.range = [0 : index, 127 : index]}
+  %block_id_x  = gpu.block_id  x {xla.range = [0 : index, 24575 : index]}
+
+  %xla_loop = xla_gpu.loop (%thread_id_x, %block_id_x)[%vector_index]
+      -> (%dim0, %dim1, %dim2) in #map
+      iter_args(%iter = %output) -> (tensor<6x512x4096xbf16>) {
+    %pure_call = xla_gpu.pure_call @gelu(%input, %dim0, %dim1, %dim2)
+        : (tensor<6x512x4096xbf16>, index, index, index) -> bf16
+    %inserted = tensor.insert %pure_call into %iter[%dim0, %dim1, %dim2]
+        : tensor<6x512x4096xbf16>
+    xla_gpu.yield %inserted : tensor<6x512x4096xbf16>
+  }
+  return %xla_loop : tensor<6x512x4096xbf16>
+}
+```
+
+### Step 2: Inliner
+
+The `@gelu` function is inlined into `@main`. If a function is called more than once, it is not inlined. See `xla_gpu_dialect.cc` for the inlining rules.
+
+### Step 3: `xla_gpu` to `scf` Conversion
+
+**File:** `xla/backends/gpu/codegen/emitters/transforms/lower_xla_gpu_to_scf.cc`
+
+`xla_gpu.loop` is converted to `scf.for` with an `scf.if` boundary check inside:
+
+```mlir
+%xla_loop = scf.for %vector_index = %c0 to %c4 step %c1
+    iter_args(%iter = %output) -> (tensor<6x512x4096xbf16>) {
+  %inbounds = ...  // range checks on thread_id and block_id
+  %9 = scf.if %inbounds -> (tensor<6x512x4096xbf16>) {
+    %dim = xla_gpu.apply_indexing #map(...)
+    %extracted = tensor.extract %input[...]
+    // ... arithmetic
+    scf.yield %inserted : tensor<6x512x4096xbf16>
+  } else {
+    scf.yield %iter : tensor<6x512x4096xbf16>
+  }
+  scf.yield %9 : tensor<6x512x4096xbf16>
+}
+```
+
+### Step 4: Flatten Tensors
+
+**File:** `xla/backends/gpu/codegen/emitters/transforms/flatten_tensors.cc`
+
+N-dimensional tensors are projected to 1D. This simplifies vectorization and LLVM lowering, since every tensor access now corresponds directly to the physical memory layout:
+
+```mlir
+func.func @main(%input: tensor<12582912xbf16>, %output: tensor<12582912xbf16>)
+    -> tensor<12582912xbf16> {
+  %xla_loop = scf.for %vector_index = %c0 to %c4 step %c1 ... {
+    %dim = xla_gpu.apply_indexing #map(%thread_id_x, %block_id_x, %vector_index)
+    %extracted = tensor.extract %input[%dim] : tensor<12582912xbf16>
+    // ... arithmetic
+  }
+}
+```
+
+### Step 5: Vectorization
+
+**File:** `xla/backends/gpu/codegen/emitters/transforms/vectorize_loads_stores.cc`
+
+If `tensor.extract` and `tensor.insert` access contiguous, aligned elements with respect to `%vector_index`, they are converted to `vector.transfer_read` / `vector.transfer_write` and hoisted out of the loop:
+
+```mlir
+%2 = vector.transfer_read %input[%0], %cst {in_bounds = [true]}
+    : tensor<12582912xbf16>, vector<4xbf16>
+%xla_loop:2 = scf.for %vector_index = %c0 to %c4 step %c1
+    iter_args(%iter = %output, %iter_vector = %vector_0) -> (...) {
+  %5 = vector.extract %2[%vector_index] : bf16 from vector<4xbf16>
+  // ... arithmetic per element
+  %15 = vector.insert %14, %iter_vector [%vector_index] : bf16 into vector<4xbf16>
+  scf.yield %iter, %15 : ...
+}
+%4 = vector.transfer_write %xla_loop#1, %output[%0] {in_bounds = [true]}
+    : vector<4xbf16>, tensor<12582912xbf16>
+```
+
+### Step 6: Loop Unrolling
+
+**File:** `xla/backends/gpu/codegen/emitters/transforms/optimize_loops.cc`
+
+Short `scf.for` loops (like the vector element loop from step 5) are unrolled, eliminating the loop overhead:
+
+```mlir
+%3  = vector.extract %2[%c0] : bf16 from vector<4xbf16>
+// ... arithmetic for element 0
+%13 = vector.insert %12, %cst_0 [%c0] : bf16 into vector<4xbf16>
+%14 = vector.extract %2[%c1] : bf16 from vector<4xbf16>
+// ... arithmetic for element 1
+// (repeated for elements 2 and 3)
+%47 = vector.transfer_write %46, %arg1[%dim] : vector<4xbf16>, tensor<12582912xbf16>
+```
+
+### Step 7: Conversion to LLVM
+
+The final lowering converts the MLIR to LLVM IR. XLA uses custom lowerings instead of `memref` because it doesn't bufferize the IR and has a different ABI:
+
+- **`lower_tensors.cc`**: `tensor.extract` → `llvm.load`, `tensor.insert` → `llvm.store`.
+- **`propagate_slice_indices.cc`** and **`merge_pointers_to_same_slice.cc`**: Deduplicate function arguments for tensors sharing the same buffer slice.
+
+```llvm
+llvm.func @main(%arg0: !llvm.ptr, %arg1: !llvm.ptr) {
+  %11 = nvvm.read.ptx.sreg.tid.x : i32
+  %12 = nvvm.read.ptx.sreg.ctaid.x : i32
+  %16 = llvm.getelementptr inbounds %arg0[%15] : (!llvm.ptr, i32) -> !llvm.ptr, bf16
+  %17 = llvm.load %16 invariant : !llvm.ptr -> vector<4xbf16>
+  // ... arithmetic
+}
+```
+
+## Transpose Emitter
+
+The transpose emitter differs from the loop emitter only in its entry function generation. It uses **two loop nests** with a shared memory staging buffer:
+
+```mlir
+func.func @transpose(%arg0: tensor<20x160x170xf32>, %arg1: tensor<170x160x20xf32>)
+    -> tensor<170x160x20xf32> {
+  %shmem = xla_gpu.allocate_shared : tensor<32x1x33xf32>
+
+  // Loop 1: coalesced reads from input → shared memory
+  %xla_loop = xla_gpu.loop (...) iter_args(%iter = %shmem) -> (tensor<32x1x33xf32>) {
+    %extracted = tensor.extract %arg0[...]
+    %0 = math.exp %extracted : f32
+    %inserted = tensor.insert %0 into %iter[...]
+    xla_gpu.yield %inserted : tensor<32x1x33xf32>
+  }
+
+  %synced_tensor = xla_gpu.sync_threads %xla_loop : tensor<32x1x33xf32>
+
+  // Loop 2: coalesced writes from shared memory → output
+  %xla_loop_0 = xla_gpu.loop (...) iter_args(%iter = %arg1) -> (tensor<170x160x20xf32>) {
+    %extracted = tensor.extract %synced_tensor[...]
+    %2 = math.absf %extracted : f32
+    %inserted = tensor.insert %2 into %iter[...]
+    xla_gpu.yield %inserted : tensor<170x160x20xf32>
+  }
+  return %xla_loop_0 : tensor<170x160x20xf32>
+}
+```
+
+`xla_gpu.allocate_shared` allocates a tile in shared memory. `xla_gpu.sync_threads` inserts a thread barrier between the two loops.
+
+## Debugging: Inspecting IR at Each Pass
+
+To dump the IR after every pass in the compilation pipeline, use:
+
+```bash
+run_hlo_module \
+  --platform=CUDA \
+  --xla_disable_all_hlo_passes \
+  --reference_platform="" \
+  /tmp/gelu.hlo \
+  --xla_dump_emitter_re=mlir-fusion \
+  --xla_dump_to=<output_directory>
+```
+
+## Source References
+
+| Component | File |
+|-----------|------|
+| Emitter base class | `xla/backends/gpu/codegen/emitters/emitter_base.h` |
+| Computation partitioner | `xla/codegen/emitters/computation_partitioner.h` |
+| Elemental emission | `xla/codegen/emitters/elemental_hlo_to_mlir.h` |
+| Loop emitter | `xla/backends/gpu/codegen/emitters/loop.h` |
+| MLIR transform passes | `xla/backends/gpu/codegen/emitters/transforms/` |
+| Hero-based emitters | `xla/backends/gpu/codegen/emitters/` |
+| XLA GPU ops dialect | `xla/backends/gpu/codegen/emitters/ir/xla_gpu_ops.td` |

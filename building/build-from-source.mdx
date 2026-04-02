@@ -1,0 +1,188 @@
+---
+title: "Build from Source"
+description: "Build XLA from source for CPU and GPU targets using Docker or a local toolchain."
+---
+
+XLA uses [Bazel](https://bazel.build) as its build system. The recommended approach is to build inside the `ml-build` Docker container, which mirrors XLA's CI environment and comes with Clang 18 pre-installed.
+
+## Prerequisites
+
+- **Bazel / Bazelisk** — Install [Bazelisk](https://github.com/bazelbuild/bazelisk#readme) to automatically download the correct Bazel version. If Bazelisk is unavailable, install [Bazel](https://bazel.build/install) manually.
+- **Docker** — Required for the recommended containerized build path. Install [Docker](https://www.docker.com/).
+- **Clang 18** — Required if building without Docker. XLA's CI uses Clang 18; earlier versions may work.
+
+## Linux
+
+<Tabs>
+  <Tab title="CPU build">
+    <Steps>
+      <Step title="Start the Docker container">
+        Run the `ml-build` container, mounting your local XLA checkout at `/xla`:
+
+        ```sh
+        docker run -itd --rm \
+          --name xla \
+          -w /xla \
+          -v $PWD:/xla \
+          us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest \
+          bash
+        ```
+      </Step>
+      <Step title="Configure the build">
+        Run `configure.py` with the CPU backend:
+
+        ```sh
+        docker exec xla ./configure.py --backend=CPU
+        ```
+      </Step>
+      <Step title="Build XLA">
+        ```sh
+        docker exec xla bazel build \
+          --spawn_strategy=sandboxed \
+          --test_output=all \
+          //xla/...
+        ```
+
+        <Note>
+          Your first build will take a while — it compiles the full stack including XLA, MLIR, and StableHLO.
+        </Note>
+      </Step>
+    </Steps>
+
+    **Without Docker**, install Clang 18 on your host machine and run the commands directly:
+
+    ```sh
+    ./configure.py --backend=CPU
+
+    bazel build \
+      --spawn_strategy=sandboxed \
+      --test_output=all \
+      //xla/...
+    ```
+  </Tab>
+  <Tab title="GPU / CUDA build">
+    <Steps>
+      <Step title="Start the Docker container">
+        If GPUs are available on your machine, pass `--gpus all` to expose them to the container. CUDA compute capabilities will then be detected automatically via `nvidia-smi`.
+
+        ```sh
+        docker run -itd --rm \
+          --gpus all \
+          --name xla_gpu \
+          -w /xla \
+          -v $PWD:/xla \
+          us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest \
+          bash
+        ```
+
+        <Note>
+          Building on a machine **without** GPUs is fully supported thanks to XLA's hermetic CUDA rules. In that case, omit `--gpus all` and specify compute capabilities manually in the next step.
+        </Note>
+      </Step>
+      <Step title="Configure the build">
+        If GPUs are present, compute capabilities are detected automatically:
+
+        ```sh
+        docker exec xla_gpu ./configure.py --backend=CUDA
+        ```
+
+        If building without GPUs, specify compute capabilities manually:
+
+        ```sh
+        docker exec xla_gpu ./configure.py --backend=CUDA \
+          --cuda_compute_capabilities="9.0"
+        ```
+      </Step>
+      <Step title="Build XLA">
+        ```sh
+        docker exec xla_gpu bazel build \
+          --spawn_strategy=sandboxed \
+          --test_output=all \
+          //xla/...
+        ```
+      </Step>
+    </Steps>
+
+    **Without Docker**, hermetic CUDA lets you build GPU targets on any Linux machine — even one without a GPU or NVIDIA driver installed:
+
+    ```sh
+    # With GPUs available — auto-detects compute capabilities
+    ./configure.py --backend=CUDA
+
+    # Without GPUs — specify compute capabilities manually
+    ./configure.py --backend=CUDA --cuda_compute_capabilities="9.0"
+
+    bazel build \
+      --spawn_strategy=sandboxed \
+      --test_output=all \
+      //xla/...
+    ```
+  </Tab>
+</Tabs>
+
+## Build inside the JAX CI container
+
+XLA is the compiler backend for JAX. If you need your XLA build configuration to exactly match a JAX release build (for example, to reproduce a workload result), you can build XLA targets inside the JAX CI container.
+
+<Steps>
+  <Step title="Clone JAX and navigate to the repo">
+    ```bash
+    git clone https://github.com/jax-ml/jax.git
+    cd jax
+    ```
+  </Step>
+  <Step title="Start the JAX CI container">
+    ```bash
+    ./ci/utilities/run_docker_container.sh
+    ```
+
+    This starts a container named `jax`.
+  </Step>
+  <Step title="Build the JAX CUDA plugin to generate the Bazel config">
+    ```bash
+    docker exec jax ./ci/build_artifacts.sh jax-cuda-plugin
+    ```
+
+    This creates `.jax_configure.bazelrc` with CUDA/cuDNN configuration.
+  </Step>
+  <Step title="Open an interactive shell">
+    ```bash
+    docker exec -ti jax /bin/bash
+    ```
+
+    You will be placed in `/jax` inside the container.
+  </Step>
+  <Step title="Build the XLA target">
+    ```bash
+    /usr/local/bin/bazel build \
+      --config=cuda_libraries_from_stubs \
+      --verbose_failures=true \
+      @xla//xla/tools/multihost_hlo_runner:hlo_runner_main
+    ```
+
+    Optionally override hermetic CUDA compute capabilities:
+
+    ```bash
+    --repo_env=HERMETIC_CUDA_COMPUTE_CAPABILITIES="sm_90"
+    ```
+  </Step>
+  <Step title="Copy artifacts to the host (optional)">
+    ```bash
+    cp bazel-bin/external/xla/xla/tools/multihost_hlo_runner/hlo_runner_main \
+      ./dist/
+    ```
+  </Step>
+  <Step title="Exit the container">
+    ```bash
+    exit
+    ```
+  </Step>
+</Steps>
+
+## configure.py flags reference
+
+| Flag | Description |
+|---|---|
+| `--backend=CPU` | Configure for CPU-only builds |
+| `--backend=CUDA` | Configure for GPU/CUDA builds |
+| `--cuda_compute_capabilities` | Comma-separated CUDA compute capabilities (e.g. `"9.0"`, `"8.0,9.0"`). Required when building without GPUs present. |

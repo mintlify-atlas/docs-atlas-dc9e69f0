@@ -1,0 +1,164 @@
+---
+title: "XLA:GPU Architecture"
+description: "An overview of the XLA GPU compilation pipeline, from HLO input to PTX output, covering optimizations, code generation strategies, and the runtime."
+---
+
+## Introduction
+
+XLA is a hardware- and framework-agnostic domain-specific compiler for linear algebra. Frameworks such as JAX, TensorFlow, and PyTorch convert user programs to [StableHLO](https://github.com/openxla/stablehlo) — a set of roughly 100 statically shaped operations — which XLA then compiles to optimized machine code for the target hardware.
+
+During execution, frameworks invoke the [PJRT runtime](https://opensource.googleblog.com/2023/05/pjrt-simplifying-ml-hardware-and-framework-integration.html) API. PJRT provides a uniform interface for the operation: "populate the specified output buffers by executing a given StableHLO program on a specific device."
+
+## GPU Compilation Pipeline
+
+XLA:GPU uses a combination of native LLVM/PTX emitters and Triton IR emitters to generate high-performance GPU kernels.
+
+### Three Code Generation Approaches
+
+<CardGroup cols={3}>
+  <Card title="External Libraries" icon="layer-group">
+    Delegate to NVIDIA libraries: cuBLAS, cuDNN, NCCL. Fast and verified, but limits fusion opportunities.
+  </Card>
+  <Card title="Triton IR" icon="bolt">
+    Translate HLO fusions to TritonIR (an MLIR dialect). Best for GEMM and softmax fusions. Near-roofline performance on Ampere.
+  </Card>
+  <Card title="XLA Native Emitters" icon="microchip">
+    Generate LLVM IR directly from HLO. Used for reductions, transposes, and elementwise ops.
+  </Card>
+</CardGroup>
+
+## Running Example: JAX
+
+To illustrate the pipeline, consider a JAX function that computes a scaled, negated matmul:
+
+```python
+def f(a, b):
+    return -((a @ b) * 0.125)
+```
+
+Setting up inputs and printing the unoptimized HLO:
+
+```python
+import jax, jax.numpy as jnp
+
+M, K, N = 1024, 512, 2048
+key = jax.random.PRNGKey(1701)
+a = jax.random.randint(key, (M, K), dtype=jnp.int8, minval=0, maxval=255)
+b = jax.random.normal(key, (K, N), dtype=jax.dtypes.bfloat16)
+
+print(jax.xla_computation(f)(a, b).as_hlo_text())
+```
+
+The unoptimized HLO:
+
+```hlo
+HloModule xla_computation_f,
+  entry_computation_layout={(s8[1024,512]{1,0}, bf16[512,2048]{1,0})->(bf16[1024,2048]{1,0})}
+
+ENTRY main.10 {
+  Arg_0.1 = s8[1024,512]{1,0} parameter(0)
+  convert.5 = bf16[1024,512]{1,0} convert(Arg_0.1)
+  Arg_1.2 = bf16[512,2048]{1,0} parameter(1)
+  dot.6 = bf16[1024,2048]{1,0} dot(convert.5, Arg_1.2),
+            lhs_contracting_dims={1}, rhs_contracting_dims={0}
+  constant.3 = bf16[] constant(0.125)
+  broadcast.4 = bf16[1024,2048]{1,0} broadcast(constant.3), dimensions={}
+  multiply.7 = bf16[1024,2048]{1,0} multiply(dot.6, broadcast.4)
+  ROOT negate.8 = bf16[1024,2048]{1,0} negate(multiply.7)
+}
+```
+
+## HLO Optimization Passes
+
+A number of key optimization passes transform HLO before code generation.
+
+### SPMD Partitioner
+
+The [GSPMD](https://arxiv.org/pdf/2105.04663.pdf) partitioner consumes HLO with sharding annotations (from `jax.pjit`) and produces a sharded HLO that runs across multiple hosts and devices. It also optimizes execution schedules to overlap computation and communication.
+
+```python
+with jax.sharding.Mesh([['cpu:0', 'cpu:1']], ('x', 'y')):
+    @pjit
+    def f(a, b):
+        out = -((a @ b) * 0.125)
+        out = with_sharding_constraint(out, jax.lax.PartitionSpec('x', 'y'))
+        return out
+```
+
+### Layout Assignment
+
+HLO decouples the logical shape of a tensor from its physical memory layout. A matrix `f32[32, 64]` can be stored row-major (`{1,0}`) or column-major (`{0,1}`).
+
+The Layout Assignment pass selects an optimal layout for each operation — for example, NHWC format for a convolution on Ampere, or `{0,1}` for the RHS of an `int8×int8→int32` matmul. Layouts are propagated through the graph, and conflicts are resolved by inserting `copy` operations that perform physical transpositions.
+
+### Fusion
+
+Fusion is XLA's most impactful optimization. It groups multiple operations into a single GPU kernel, eliminating intermediate tensor materializations in HBM (GPU high-bandwidth memory). Since many GPU workloads are memory-bound, fusion dramatically reduces execution time.
+
+Key invariants of a fusion:
+- No intermediate storage inside the fusion is materialized in HBM.
+- A fusion always compiles to exactly one GPU kernel.
+
+After optimization, the running example produces a single Triton-backed fusion:
+
+```hlo
+%triton_gemm_dot.6_computation (parameter_0: s8[3,2], parameter_1: bf16[2,3]) -> bf16[3,3] {
+  %parameter_0 = s8[3,2]{1,0} parameter(0)
+  %convert.0 = bf16[3,2]{1,0} convert(s8[3,2]{1,0} %parameter_0)
+  %parameter_1 = bf16[2,3]{1,0} parameter(1)
+  %dot.0 = bf16[3,3]{1,0} dot(bf16[3,2]{1,0} %convert.0, bf16[2,3]{1,0} %parameter_1),
+             lhs_contracting_dims={1}, rhs_contracting_dims={0}
+  ...
+  ROOT %convert.6 = bf16[3,3]{1,0} convert(f32[3,3]{1,0} %negate.0)
+}
+
+ENTRY %main.9 (Arg_0.1: s8[3,2], Arg_1.2: bf16[2,3]) -> bf16[3,3] {
+  ROOT %triton_gemm_dot.6 = bf16[3,3]{1,0} fusion(...), kind=kCustom,
+    calls=%triton_gemm_dot.6_computation,
+    backend_config={"kind":"__triton_gemm","triton_gemm_config":{
+      "block_m":"64","block_n":"64","block_k":"64",
+      "split_k":"1","num_stages":"2","num_warps":"4"}}
+}
+```
+
+The `backend_config` specifies that Triton will be used for code generation and provides the selected tiling parameters.
+
+## Buffer Assignment and Scheduling
+
+A buffer assignment pass uses shape information to produce an optimal buffer allocation plan for the entire computation. Unlike eager-mode execution in TF or PyTorch (where the allocator operates without global graph knowledge), XLA can "look into the future" and minimize the peak amount of intermediate memory consumed.
+
+## Compiler Backend: Code Generation and Library Selection
+
+For each HLO instruction in the computation, XLA:GPU decides whether to execute it via a linked library or by generating PTX directly.
+
+### Library Selection
+
+For many common operations, XLA:GPU delegates to NVIDIA's high-performance libraries:
+
+| Library | Operations |
+|---------|-----------|
+| cuBLAS  | Matrix multiplications, GEMM |
+| cuDNN   | Convolutions, normalization |
+| NCCL    | Collective communication |
+
+Libraries offer verified fast performance but often preclude complex fusion opportunities.
+
+### Direct Code Generation (XLA Native Emitters)
+
+XLA:GPU generates high-performance LLVM IR directly for operations like reductions and transposes. See [XLA:GPU Code Emitters](/internals/emitters) for details on this path.
+
+### Triton Code Generation
+
+For fusions involving matrix multiplication or softmax, XLA:GPU uses [Triton](https://github.com/openai/triton) as a code generation layer:
+
+1. HLO fusions are converted to TritonIR (an MLIR dialect).
+2. Tiling parameters are selected (via autotuning — see [Persisted Autotuning](/internals/persisted-autotuning)).
+3. Triton generates PTX.
+
+The resulting code achieves near-roofline performance on Ampere GPUs with properly tuned tile sizes.
+
+## Runtime
+
+XLA Runtime converts the resulting sequence of CUDA kernel calls and library invocations into RuntimeIR (an MLIR dialect within XLA). CUDA graph extraction is performed on this IR, enabling sequences of GPU operations to be recorded once and replayed with minimal CPU overhead. Once CUDA graph boundaries are extracted, RuntimeIR is compiled via LLVM to a CPU executable.
+
+The PJRT runtime API is the primary interface for frameworks to interact with compiled executables. See [HLO to Thunks](/internals/hlo-to-thunks) for how the final executable is structured.

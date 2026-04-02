@@ -1,0 +1,286 @@
+---
+title: "PJRT Examples"
+description: "Real-world examples of PJRT plugins and framework integrations across hardware vendors and ML frameworks."
+keywords: ["PJRT", "examples", "JAX", "plugin", "CUDA", "GPU", "CPU"]
+---
+
+This page collects real-world examples of PJRT integrations, covering hardware plugins,
+framework integrations, and the communication trace between a JAX program and a PJRT plugin.
+
+## Example: JAX CUDA plugin
+
+The JAX CUDA plugin is the canonical example of a full PJRT C API integration.
+
+<Steps>
+  <Step title="Implement the PJRT C API">
+    Provide a C API implementation through the GPU wrapper:
+    [`pjrt_c_api_gpu.h`](https://github.com/openxla/xla/blob/main/xla/pjrt/c/pjrt_c_api_gpu.h)
+  </Step>
+  <Step title="Set up the package entry point">
+    Define the Python package with an entry point so JAX can discover the plugin:
+    [`setup.py`](https://github.com/google/jax/blob/main/jax_plugins/cuda/setup.py)
+  </Step>
+  <Step title="Implement initialize()">
+    Register the plugin with `xla_bridge.register_plugin` in your module's `initialize()` method:
+    [`__init__.py`](https://github.com/google/jax/blob/a10854786b6d1bc92a65dd314916b151640789af/plugins/cuda/__init__.py#L31-L51)
+  </Step>
+  <Step title="Test with JAX CUDA tests">
+    The plugin can be tested with any JAX tests that target CUDA.
+  </Step>
+</Steps>
+
+## Integrating a plugin with JAX
+
+### Installing JAX
+
+Use JAX nightly or build from source:
+
+```bash
+# Install JAX nightly
+pip install --pre -U jaxlib -i https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/
+pip install git+https://github.com/google/jax
+
+# Match jaxlib version with your PJRT C API version
+pip install --pre -U jaxlib==0.6.1.dev20250428 -i https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/
+```
+
+### Plugin discovery
+
+JAX supports two methods for plugins to be discovered:
+
+<Tabs>
+  <Tab title="Namespace packages">
+
+Place your plugin module under the `jax_plugins` namespace package:
+
+```
+jax_plugins/
+  my_plugin/
+    __init__.py
+    my_plugin.so
+```
+
+  </Tab>
+  <Tab title="Package entry points">
+
+Advertise your plugin via `pyproject.toml` or `setup.py`:
+
+```toml
+# pyproject.toml
+[project.entry-points.'jax_plugins']
+my_plugin = 'my_plugin'
+```
+
+```python
+# setup.py
+entry_points={
+  "jax_plugins": [
+    "my_plugin = my_plugin",
+  ],
+}
+```
+
+  </Tab>
+</Tabs>
+
+### Registering the plugin
+
+Implement `initialize()` in your Python module:
+
+```python
+import os
+import jax._src.xla_bridge as xb
+
+def initialize():
+    path = os.path.join(os.path.dirname(__file__), 'my_plugin.so')
+    xb.register_plugin('my_plugin', priority=500, library_path=path, options=None)
+```
+
+To verify the plugin loads and set it as the default backend:
+
+```python
+jax.config.update("jax_platforms", "my_plugin")
+```
+
+### Basic tests
+
+```python
+# Basic addition
+print(jax.numpy.add(1, 1))
+# => 2
+
+# JIT-compiled function
+print(jax.jit(lambda x: x * 2)(1.))
+# => 2.0
+
+# Multi-device pmap
+arr = jax.numpy.arange(jax.device_count())
+print(jax.pmap(lambda x: x + jax.lax.psum(x, 'i'), axis_name='i')(arr))
+# single device: [0]
+# 4 devices: [6 7 8 9]
+```
+
+## Example communication trace
+
+The following shows the complete method call sequence for loading a PJRT plugin and
+running `y = jax.jit(lambda x: jnp.power(x, jnp.int32(2)))(1)` with the StableHLO
+Reference PJRT plugin.
+
+<Accordion title="Full interaction log">
+
+```
+//////////////////////////////////
+// Load the plugin
+//////////////////////////////////
+
+I client_cpp_pjrt.cc:55] StablehloReferencePjrtClient(0x23bac400)
+I device.cc:53] StablehloReferenceDeviceDescription(0x23bac4f8)
+I device.cc:104] StablehloReferenceDevice(0x23bac4e0)
+I device.cc:123] client(0x23bac4e0)
+I client_cpp_pjrt.cc:67] platform_name(0x23bac400)
+I device.cc:143] AttachDefaultMemorySpace(0x23bac4e0)
+I client_cpp_pjrt.cc:86] devices(0x23bac400)
+I client_cpp_pjrt.cc:81] addressable_device_count(0x23bac400)
+I device.cc:168] description(0x23bac4e0)
+I device.cc:86] Attributes(0x23bac4f8)
+I device.cc:128] IsAddressable(0x23bac4e0)
+I client_cpp_pjrt.cc:95] memory_spaces(0x23bac400)
+I device.cc:148] memory_spaces(0x23bac4e0)
+Creating PJRT Client from client
+I client_cpp_pjrt.cc:108] platform_version(0x23bac400)
+I client_cpp_pjrt.cc:67] platform_name(0x23bac400)
+
+//////////////////////////////////
+// RUN: y = jax.jit(lambda x: jnp.power(x, jnp.int32(2)))(1)
+//////////////////////////////////
+
+I executable.cc:309] num_partitions(0x240bab70)
+I executable.cc:305] num_replicas(0x240bab70)
+I client_cpp_pjrt.cc:233] BufferFromHostBuffer(0x23bac400)
+I buffer.cc:285] CreateMlirBufferFromLiteral
+I buffer.cc:98] CreateFromLiteral
+I buffer.cc:99] CreateFromLiteral: s32[] 2
+I buffer.cc:64] MlirPjrtBuffer(0x240bb050)
+I executable.cc:328] GetHloModules(0x240bab70)
+I executable.cc:240] Execute(0x240bab70)
+I executable.cc:197] ExecuteWithReferenceInterpreter(0x240bab70)
+I buffer.cc:303] GetAttributeFromBuffer
+I buffer.cc:229] IsDeleted(0x240bb050)
+I buffer.cc:311] GetAttributeFromBuffer(0x240bb050) -> dense<2> : tensor<i32>
+I executable.cc:205] EvalModule:
+module @jit attributes {mhlo.num_partitions = 1 : i32, mhlo.num_replicas = 1 : i32} {
+  func.func public @main(%arg0: tensor<i32> {mhlo.layout_mode = "default"})
+      -> (tensor<i32> {jax.result_info = "", mhlo.layout_mode = "default"}) {
+    // ...
+    return %3 : tensor<i32>
+  }
+}
+I executable.cc:206] Inputs: [dense<2> : tensor<i32>]
+I executable.cc:213] Results: [dense<2> : tensor<i32>]
+I buffer.cc:291] CreateMlirBufferFromAttribute
+I buffer.cc:64] MlirPjrtBuffer(0x22cea630)
+
+//////////////////////////////////
+// RUN: print(y)
+//////////////////////////////////
+
+I buffer.cc:263] GetReadyFuture(0x22cea630)
+I buffer.cc:154] memory_space(0x22cea630)
+I buffer.cc:158] device(0x22cea630)
+I buffer.cc:129] on_device_shape(0x22cea630)
+I buffer.cc:229] IsDeleted(0x22cea630)
+I buffer.cc:269] IsOnCpu(0x22cea630)  # Returns true, allows external references.
+I buffer.cc:168] AcquireExternalReference(0x22cea630)
+I buffer.cc:303] GetAttributeFromBuffer
+I buffer.cc:311] GetAttributeFromBuffer(0x22cea630) -> dense<2> : tensor<i32>
+I buffer.cc:263] GetReadyFuture(0x22cea630)
+```
+
+</Accordion>
+
+## Framework implementations
+
+Several frameworks implement PJRT integrations that can serve as reference:
+
+<AccordionGroup>
+
+<Accordion title="JAX">
+
+[`jax-ml/jax`](https://github.com/jax-ml/jax/blob/main/jax/_src/compiler.py#L248) interacts with
+PJRT APIs via the `xla_client` APIs.
+
+</Accordion>
+
+<Accordion title="GoMLX">
+
+- [`gomlx/gopjrt`](https://github.com/gomlx/gopjrt) — Go PJRT bindings
+- [`gomlx/gomlx > backends/xla`](https://github.com/gomlx/gomlx/tree/main/backends/xla/xla.go) — GoMLX XLA backend
+
+</Accordion>
+
+<Accordion title="ZML (Zig)">
+
+- PJRT API wrapper: [`pjrt.zig`](https://github.com/zml/zml/blob/master/pjrt/pjrt.zig)
+- Load PJRT plugin: [`context.zig`](https://github.com/zml/zml/blob/master/zml/context.zig#L30-L34)
+- Interacting with PJRT buffers: [`buffer.zig`](https://github.com/zml/zml/blob/master/zml/buffer.zig#L36)
+- Execute a module via PJRT: [`module.zig`](https://github.com/zml/zml/blob/master/zml/module.zig#L863-L886)
+
+</Accordion>
+
+</AccordionGroup>
+
+## Hardware plugin implementations
+
+<AccordionGroup>
+
+<Accordion title="Full integration plugins (PJRT + MLIR + XLA)">
+
+These plugins use the complete XLA compilation stack:
+
+- [XLA CPU Plugin](https://github.com/openxla/xla/tree/main/xla/pjrt/cpu/cpu_client.cc)
+- [XLA GPU Plugin](https://github.com/openxla/xla/tree/main/xla/pjrt/gpu/se_gpu_pjrt_client.cc)
+- [Intel XLA Plugin](https://github.com/intel/intel-extension-for-openxla)
+
+</Accordion>
+
+<Accordion title="Light integration plugins (PJRT + MLIR)">
+
+These plugins implement PJRT with MLIR but without XLA:
+
+- StableHLO Reference Interpreter plugin (MLIR-based, C++ plugin)
+- [Tenstorrent-XLA plugin](https://github.com/tenstorrent/tt-xla/blob/main/src/common/pjrt_implementation/api_bindings.cc) (MLIR-based, C plugin)
+
+</Accordion>
+
+</AccordionGroup>
+
+## Implementing PJRT_Client_Create
+
+The `PJRT_Client_Create` function is the main entry point for your plugin. Using the
+C++ wrapper:
+
+```cpp
+#include "xla/pjrt/c/pjrt_c_api_wrapper_impl.h"
+
+namespace my_plugin {
+
+PJRT_Error* PJRT_Client_Create(PJRT_Client_Create_Args* args) {
+  std::unique_ptr<xla::PjRtClient> client = GetPluginPjRtClient();
+  args->client = pjrt::CreateWrapperClient(std::move(client));
+  return nullptr;
+}
+
+}  // namespace my_plugin
+```
+
+Then expose `GetPjRtApi()`:
+
+```cpp
+const PJRT_Api* GetPjrtApi() {
+  static const PJRT_Api pjrt_api =
+      pjrt::CreatePjrtApi(my_plugin::PJRT_Client_Create);
+  return &pjrt_api;
+}
+```
+
+For a complete walkthrough see the [PJRT integration guide](https://github.com/openxla/xla/blob/main/xla/pjrt/c/docs/pjrt_integration_guide.md).

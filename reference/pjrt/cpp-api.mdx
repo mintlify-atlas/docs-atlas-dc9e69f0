@@ -1,0 +1,328 @@
+---
+title: "PJRT C++ API"
+description: "Reference for the PJRT C++ interfaces: PjRtClient, PjRtDevice, PjRtMemorySpace, PjRtBuffer, PjRtCompiler, and PjRtLoadedExecutable."
+keywords: ["PJRT", "C++ API", "PjRtClient", "PjRtDevice", "PjRtBuffer", "PjRtExecutable"]
+---
+
+PJRT offers both a C API (for ABI stability) and a C++ API. The C++ API uses classes to
+abstract away implementation details but has stronger ties to XLA datatypes. This page
+documents the C++ API.
+
+<Note>
+The PJRT C++ API is defined in
+[`xla/pjrt/pjrt_client.h`](https://github.com/openxla/xla/blob/main/xla/pjrt/pjrt_client.h).
+All five components have backpointers: buffers know their memory space, devices know their
+client, memory spaces know their device(s) and client.
+</Note>
+
+## Component overview
+
+```
+PjRtClient
+├── PjRtDevice[]
+│   └── PjRtMemorySpace[]
+│       └── PjRtBuffer[]
+└── PjRtLoadedExecutable
+    └── Execute() → PjRtBuffer[]
+```
+
+---
+
+## PjRtClient
+
+[Full reference](https://github.com/openxla/xla/blob/924b74d84de3760cc589fd1525c7346691d51df5/xla/pjrt/pjrt_client.h#L486)
+
+`PjRtClient` manages all communication between the device and the framework. It encapsulates
+all state used in that communication, owns the devices and memory spaces for a given plugin,
+and provides the main entry point for compiling and executing programs.
+
+### Key methods
+
+<AccordionGroup>
+
+<Accordion title="Device enumeration">
+
+```cpp
+// Returns all devices known to the client, including remote devices.
+virtual absl::Span<PjRtDevice* const> devices() const = 0;
+
+// Returns only devices local to this host/process.
+virtual absl::Span<PjRtDevice* const> addressable_devices() const = 0;
+
+// Returns all memory spaces known to the client.
+virtual absl::Span<PjRtMemorySpace* const> memory_spaces() const = 0;
+```
+
+</Accordion>
+
+<Accordion title="Platform information">
+
+```cpp
+virtual int process_index() const = 0;
+virtual absl::string_view platform_name() const = 0;
+virtual absl::string_view platform_version() const = 0;
+```
+
+</Accordion>
+
+<Accordion title="Buffer creation">
+
+```cpp
+// Transfer a host buffer to the device.
+absl::StatusOr<std::unique_ptr<PjRtBuffer>> BufferFromHostBuffer(
+    const void* data,
+    PrimitiveType type,
+    absl::Span<int64_t const> dims,
+    std::optional<absl::Span<int64_t const>> byte_strides,
+    HostBufferSemantics host_buffer_semantics,
+    absl::AnyInvocable<void() &&> on_done_with_host_buffer,
+    PjRtMemorySpace* memory_space,
+    const Layout* device_layout = nullptr);
+```
+
+`HostBufferSemantics` controls whether the host buffer data is shared, copied, or mutated.
+
+</Accordion>
+
+<Accordion title="Compilation and execution">
+
+```cpp
+// Compile an XLA computation or StableHLO module.
+absl::StatusOr<std::unique_ptr<PjRtLoadedExecutable>> Compile(
+    const XlaComputation& computation,
+    CompileOptions options);
+
+absl::StatusOr<std::unique_ptr<PjRtLoadedExecutable>> Compile(
+    mlir::ModuleOp module,
+    CompileOptions options);
+```
+
+</Accordion>
+
+</AccordionGroup>
+
+---
+
+## PjRtDevice
+
+[Full reference](https://github.com/openxla/xla/blob/main/xla/pjrt/pjrt_client.h#L102)
+
+`PjRtDevice` describes a single physical device. Devices have a description (with a unique
+hash identifying the device kind: GPU/CPU/xPU) and a location within a grid of devices,
+both locally and globally.
+
+<Note>
+A device does not necessarily know which buffers of data are associated with it, but can
+discover them by looking through its associated memory spaces.
+</Note>
+
+### Key methods
+
+```cpp
+// Device identification
+virtual int id() const = 0;
+virtual int local_hardware_id() const = 0;
+virtual absl::string_view device_kind() const = 0;
+virtual std::string ToString() const = 0;
+virtual std::string DebugString() const = 0;
+
+// Topology
+virtual int process_index() const = 0;
+virtual bool IsAddressable() const = 0;
+
+// Associated resources
+virtual PjRtClient* client() const = 0;
+virtual absl::Span<PjRtMemorySpace* const> memory_spaces() const = 0;
+virtual absl::StatusOr<PjRtMemorySpace*> default_memory_space() const = 0;
+
+// Readiness
+virtual xla::Future<> GetReadyFuture() const = 0;
+```
+
+---
+
+## PjRtMemorySpace
+
+[Full reference](https://github.com/openxla/xla/blob/main/xla/pjrt/pjrt_client.h#L72)
+
+`PjRtMemorySpace` describes a memory location. Memory spaces can be:
+
+- **Unpinned** — free to live anywhere but accessible from a device
+- **Pinned** — must live on a specific device
+
+Memory spaces know their associated buffers, their associated devices (plural), and the
+client they belong to.
+
+### Key methods
+
+```cpp
+virtual PjRtClient* client() const = 0;
+virtual absl::Span<PjRtDevice* const> devices() const = 0;
+virtual int id() const = 0;
+virtual absl::string_view memory_space_kind() const = 0;
+virtual absl::string_view DebugString() const = 0;
+virtual absl::string_view ToString() const = 0;
+```
+
+---
+
+## PjRtBuffer
+
+[Full reference](https://github.com/openxla/xla/blob/main/xla/pjrt/pjrt_client.h#L1111)
+
+`PjRtBuffer` holds data on a device in a format that is easy to work with inside the plugin,
+such as an MLIR elements attribute or a proprietary tensor format.
+
+Frameworks transfer data to a device by calling `PjRtClient::BufferFromHostBuffer`, providing
+an `xla::Literal` (or raw data). Once a buffer is no longer needed the framework calls `Delete`.
+
+### Conversion between host and device
+
+```cpp
+// Literal to Buffer (on the client)
+absl::StatusOr<std::unique_ptr<PjRtBuffer>> BufferFromHostBuffer(...) {...}
+
+// Buffer to Literal (read data back to the host)
+xla::Future<> ToLiteral(xla::MutableLiteralBase* literal) override {...}
+```
+
+### Key methods
+
+```cpp
+// Shape and type
+virtual const Shape& on_device_shape() const = 0;
+
+// Memory location
+virtual PjRtMemorySpace* memory_space() const = 0;
+virtual PjRtDevice* device() const = 0;  // may be nullptr
+
+// Lifecycle
+virtual bool IsDeleted() const = 0;
+virtual void Delete() = 0;
+
+// Readiness (important for async plugins)
+virtual xla::Future<> GetReadyFuture() const = 0;
+
+// External references (for frameworks to hold a pointer to the data)
+virtual absl::StatusOr<std::unique_ptr<ExternalReference>>
+    AcquireExternalReference() = 0;
+```
+
+### Async buffer access
+
+Async plugins may return a buffer that is not yet populated. The buffer will be filled
+in when execution completes. Frameworks check readiness using `GetReadyFuture()`.
+
+```python
+@jax.jit
+def foo(x): return x + 1
+
+x = foo(1)
+# x is a PjRtBuffer that may not be ready yet
+# [...] other logic not using x
+
+# This blocks until x is ready:
+print(x + 1)
+```
+
+---
+
+## PjRtCompiler
+
+[Full reference](https://github.com/openxla/xla/blob/main/xla/pjrt/pjrt_compiler.h#L157)
+
+`PjRtCompiler` is an optional component providing compilation details for XLA backends.
+It is not required for a plugin to implement — the responsibility can be handled by
+`PjRtClient::Compile` directly.
+
+The compiler takes an input module (XLA computation or StableHLO) and returns a
+`PjRtLoadedExecutable`.
+
+---
+
+## PjRtExecutable / PjRtLoadedExecutable
+
+- [PjRtExecutable](https://github.com/openxla/xla/blob/main/xla/pjrt/pjrt_executable.h#L306)
+- [PjRtLoadedExecutable](https://github.com/openxla/xla/blob/main/xla/pjrt/pjrt_client.h#L1506)
+
+`PjRtExecutable` handles serialization/deserialization of compiled artifacts so an executable
+can be stored and loaded as needed.
+
+`PjRtLoadedExecutable` is the in-memory compiled executable ready for execution. It is a
+subclass of `PjRtExecutable`.
+
+### Execution methods
+
+```cpp
+// Execute on all addressable devices
+absl::StatusOr<std::vector<std::vector<std::unique_ptr<PjRtBuffer>>>>
+Execute(absl::Span<const std::vector<PjRtBuffer*>> argument_handles,
+        const ExecuteOptions& options,
+        std::optional<std::vector<FutureType>>& returned_futures) {...}
+
+// Execute an assigned replica/partition on a specific device
+absl::StatusOr<std::vector<std::unique_ptr<PjRtBuffer>>>
+ExecuteSharded(absl::Span<PjRtBuffer* const> argument_handles,
+               PjRtDevice* device,
+               const ExecuteOptions& options,
+               std::optional<FutureType>& returned_future) {...}
+
+// Execute on a specified device (single replica / partition)
+absl::StatusOr<std::vector<std::unique_ptr<PjRtBuffer>>>
+ExecutePortable(absl::Span<PjRtBuffer* const> argument_handles,
+                PjRtDevice* device,
+                const ExecuteOptions& options,
+                std::optional<FutureType>& returned_future) {...}
+```
+
+Before calling `Execute`, the framework transfers all required data to `PjRtBuffers` owned
+by the executing client, then provides these buffers as arguments.
+
+---
+
+## Futures and async computations
+
+If any part of a plugin is implemented asynchronously, it **must** properly implement futures.
+
+<Warning>
+A plugin that enqueues work asynchronously must return a `PjRtBuffer` immediately with a
+`GetReadyFuture()` that resolves when the data is populated. Frameworks rely on this contract
+to pipeline computation correctly.
+</Warning>
+
+Futures are used to determine when objects (devices, buffers) become available:
+
+```cpp
+// Check if a buffer is ready without blocking
+xla::Future<> future = buffer->GetReadyFuture();
+
+// Block until ready
+future.Await();
+
+// Register a callback
+future.OnReady([](absl::Status status) {
+  if (status.ok()) { /* buffer is ready */ }
+});
+```
+
+## Advanced features
+
+Extending beyond the base APIs enables additional JAX features. These are all opt-in:
+
+<CardGroup cols={2}>
+  <Card title="Memory spaces" icon="database">
+    Support for explicit memory placement and host/device memory management.
+  </Card>
+  <Card title="Custom layouts" icon="grid">
+    Allow frameworks to specify preferred data layouts for buffers.
+  </Card>
+  <Card title="Communication ops" icon="arrows-left-right">
+    Support send/recv operations for device-to-device communication.
+  </Card>
+  <Card title="Host offloading" icon="server">
+    Allow tensors to be offloaded to host memory during execution.
+  </Card>
+  <Card title="Sharding" icon="split">
+    Support SPMD-style sharding of tensors across multiple devices.
+  </Card>
+</CardGroup>

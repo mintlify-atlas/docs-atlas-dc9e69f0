@@ -1,0 +1,113 @@
+---
+title: "Output/Input Aliasing"
+description: "How to declare that an XLA output buffer reuses an input buffer, enabling in-place updates and reducing memory allocation overhead."
+---
+
+Aliasing lets you tell XLA that an output buffer and an input buffer are the same allocation. When the alias is honored at runtime, the computation executes in-place, avoiding an extra copy and reducing peak memory usage.
+
+## Why aliasing matters
+
+By default, XLA allocates separate buffers for every input and output. For a trivial increment operation:
+
+```mlir
+HloModule increment
+
+ENTRY entry {
+  %p = f32[] parameter(0)
+  %c = f32[] constant(1)
+  ROOT %out = f32[] add(%p, %c)
+}
+```
+
+XLA allocates two 4-byte buffers: one for `%p` and one for `%out`. If the caller no longer needs `%p` after the computation (equivalent to `p++`), the extra allocation and implicit copy are wasteful.
+
+## Compile-time aliasing
+
+You can declare an alias directly in the HLO module text using the `input_output_alias` attribute:
+
+```mlir
+HloModule increment, input_output_alias={ {}: 0 }
+
+ENTRY entry {
+  %p = f32[] parameter(0)
+  %c = f32[] constant(1)
+  ROOT %out = f32[] add(%p, %c)
+}
+```
+
+The notation `{ {}: 0 }` means: the entire output (indexed by `{}`) is aliased to input parameter `0`.
+
+For structured outputs (tuples), you can alias individual tuple leaves:
+
+```mlir
+-- Alias output element at index {1} to parameter 2
+input_output_alias={ {1}: 2 }
+```
+
+### XlaBuilder API
+
+To declare aliasing programmatically, use `XlaBuilder::SetUpAlias`:
+
+```cpp
+// Alias the entire output to parameter 0
+builder.SetUpAlias(
+    /*output_index=*/{},   // ShapeIndex into the output tuple
+    /*param_number=*/0,    // Which input parameter
+    /*param_index=*/{}     // ShapeIndex into that parameter
+);
+```
+
+The [`XlaBuilder::SetUpAlias`](https://github.com/openxla/xla/blob/main/xla/client/xla_builder.h) documentation covers the full signature, including must-alias vs may-alias semantics.
+
+## Runtime aliasing
+
+Declaring an alias at compile time does not unconditionally force the reuse. At runtime, the caller decides whether to actually donate the buffer.
+
+Input buffers are wrapped in [`ExecutionInput`](https://github.com/openxla/xla/blob/main/xla/service/executable.h) objects, each of which holds a tree of `MaybeOwningDeviceMemory`. Two behaviors are possible:
+
+<Tabs>
+  <Tab title="Buffer donated (owning)">
+    If the `ExecutionInput` is marked as **owning** the buffer, ownership transfers to the XLA runtime. The update executes in-place exactly as the compile-time alias requested. The caller must not access the input buffer after this point.
+  </Tab>
+  <Tab title="Buffer not donated (non-owning)">
+    If the `ExecutionInput` is marked as **non-owning**, XLA's *copy-protection* mechanism activates:
+
+    1. A fresh output buffer `O` is allocated.
+    2. The contents of the aliased input buffer `P` are copied into `O`.
+    3. The computation runs against `O` as if it were donated.
+
+    This guarantees correctness when the caller needs to retain the original input.
+  </Tab>
+</Tabs>
+
+The runtime API for controlling buffer donation is [`LocalClient::RunAsync`](https://github.com/openxla/xla/blob/main/xla/client/local_client.h).
+
+## Use cases
+
+<AccordionGroup>
+  <Accordion title="In-place parameter updates">
+    Training loops often update weight tensors in place (e.g., SGD step: `w = w - lr * grad`). Aliasing `w_out` to `w_in` eliminates an allocation per step, which adds up significantly over thousands of iterations.
+  </Accordion>
+  <Accordion title="Reducing peak memory">
+    When a large intermediate tensor is consumed by exactly one downstream op, aliasing the output of that op to the intermediate buffer reclaims the memory immediately. This is especially useful on accelerators with constrained HBM.
+  </Accordion>
+  <Accordion title="JAX donate_argnums">
+    JAX exposes buffer donation to Python via `jit`'s `donate_argnums` parameter. Internally, JAX uses `XlaBuilder::SetUpAlias` to declare the alias and marks the corresponding `ExecutionInput` as owning at runtime.
+  </Accordion>
+</AccordionGroup>
+
+## Must-alias vs may-alias
+
+<Note>
+XLA distinguishes between two aliasing strengths:
+
+- **Must-alias**: the compiler guarantees the output occupies the same buffer as the input. The compilation will fail if this cannot be arranged.
+- **May-alias**: the compiler uses the same buffer if possible, but falls back to a separate allocation if constraints (e.g., liveness, layout) prevent it.
+
+Use must-alias when correctness depends on the in-place update. Use may-alias as a memory optimization hint.
+</Note>
+
+## Related topics
+
+- [Shapes and Layout](/concepts/shapes-and-layout) — understanding buffer shapes and layout annotations in HLO
+- [Indexing Analysis](/concepts/indexing-analysis) — how element-level access patterns are tracked across ops

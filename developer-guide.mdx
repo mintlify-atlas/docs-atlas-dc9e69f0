@@ -1,0 +1,105 @@
+---
+title: "Developer Guide"
+description: "Get the XLA source code, set up a build environment with Bazel and Docker, configure for CPU or GPU, build the project, and submit a pull request."
+---
+
+This guide walks you through getting started as an XLA developer: from forking the repository to submitting your first pull request.
+
+## Prerequisites
+
+Before you begin:
+
+1. Review the [Contributing](/building/contributing) page and understand the contribution process.
+2. Sign the [Contributor License Agreement](https://cla.developers.google.com/about) if you haven't already.
+3. Install or configure the following:
+   - A [GitHub](https://github.com/) account
+   - [Docker](https://www.docker.com/)
+
+<Steps>
+  <Step title="Get the code">
+    Fork the [XLA repository](https://github.com/openxla/xla) on GitHub, then clone your fork — replacing `{USER}` with your GitHub username:
+
+    ```sh
+    git clone https://github.com/{USER}/xla.git
+    ```
+
+    Change into the `xla` directory and configure the upstream remote:
+
+    ```sh
+    git remote add upstream https://github.com/openxla/xla.git
+    ```
+  </Step>
+
+  <Step title="Install Bazel">
+    To build XLA, you must have Bazel installed. The recommended approach is [Bazelisk](https://github.com/bazelbuild/bazelisk#readme), which automatically downloads the correct Bazel version for XLA. If Bazelisk is unavailable, you can [install Bazel](https://bazel.build/install) manually.
+  </Step>
+
+  <Step title="Set up the Docker container">
+    Create and run the [ml-build](https://us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build) Docker container. This sets up a build environment with support for both CPU and GPU:
+
+    ```sh
+    docker run -itd --rm \
+      --name xla \
+      -w /xla \
+      -v $PWD:/xla \
+      us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest \
+      bash
+    ```
+
+    <Tip>
+      If building with GPU/CUDA support, add `--gpus all` to the command above. This grants the container access to all available GPUs and enables automatic detection of CUDA compute capabilities.
+    </Tip>
+  </Step>
+
+  <Step title="Configure">
+    Configure your build target before building. Choose CPU or GPU:
+
+    <Tabs>
+      <Tab title="CPU">
+        ```sh
+        docker exec xla ./configure.py --backend=CPU
+        ```
+      </Tab>
+      <Tab title="GPU (CUDA)">
+        CUDA compute capabilities are detected automatically by running `nvidia-smi` when GPUs are available. If you're building on a machine without GPUs, specify compute capabilities manually:
+
+        ```sh
+        # Automatically detects compute capabilities (requires GPUs)
+        docker exec xla ./configure.py --backend=CUDA
+
+        # Manually specify compute capabilities (for builds without GPUs)
+        docker exec xla ./configure.py --backend=CUDA --cuda_compute_capabilities="9.0"
+        ```
+
+        <Note>
+          Thanks to hermetic CUDA rules, you can also build XLA for GPU directly on your machine — even if it doesn't have a GPU or the NVIDIA driver installed — without using Docker. In that case, omit `docker exec xla` from the commands above.
+        </Note>
+      </Tab>
+    </Tabs>
+  </Step>
+
+  <Step title="Build">
+    Run the Bazel build command inside the Docker container:
+
+    ```sh
+    docker exec xla bazel build \
+      --spawn_strategy=sandboxed \
+      --test_output=all \
+      //xla/...
+    ```
+
+    Your first build will take quite a while because it has to build the entire stack, including XLA, MLIR, and StableHLO.
+
+    <Warning>
+      If building without GPUs, do **not** pass `--gpus all` when starting the Docker container, and manually specify CUDA compute capabilities using `--cuda_compute_capabilities` during configuration.
+    </Warning>
+
+    To learn more about build options and advanced configuration, see [Build from source](/building/build-from-source).
+  </Step>
+
+  <Step title="Create a pull request">
+    When you're ready to send your changes for review, create a [pull request](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/proposing-changes-to-your-work-with-pull-requests/about-pull-requests) against the upstream XLA repository.
+
+    To learn about the XLA code review philosophy and process, see [Contributing](/building/contributing).
+  </Step>
+</Steps>

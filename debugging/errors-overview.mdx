@@ -1,0 +1,142 @@
+---
+title: "XLA Errors Overview"
+description: "Understand XLA's two error mechanisms—statuses and CHECK failures—and how to interpret error codes, categories, and error messages."
+keywords: ["XLA", "errors", "error codes", "statuses", "CHECK", "RESOURCE_EXHAUSTED", "debugging", "runtime error"]
+---
+
+XLA errors fall into two fundamentally different categories depending on whether the failure is something a caller can recover from or a violation of internal correctness invariants.
+
+<Warning>
+  Error code standardization is an ongoing effort. Not all XLA error messages carry an attached error code yet.
+</Warning>
+
+## Two error mechanisms
+
+### Statuses (recoverable errors)
+
+Statuses represent non-fatal, expected failures. The function returns a `Status` object, and the caller is responsible for checking it and deciding how to proceed. Use cases include:
+
+- Invalid user input (wrong shapes, unsupported dtypes)
+- Expected resource constraints (memory capacity exceeded, hardware limits)
+- Configuration mismatches
+
+When an operation fails with a status, execution continues in the caller — the error is not necessarily fatal to the process.
+
+### CHECK failures (programmer errors)
+
+CHECK macro failures indicate violations of internal invariants that should never occur if the compiler is correct. When a CHECK fires:
+
+1. The error message is logged immediately.
+2. The process terminates.
+
+CHECK failures are not recoverable. Examples include null pointer dereferences that the code considers impossible, or internal state that has become inconsistent. If you see a CHECK failure, it typically indicates a compiler bug rather than a user error.
+
+## Reading an error log
+
+A typical XLA error log entry looks like this:
+
+```
+XlaRuntimeError: RESOURCE_EXHAUSTED: XLA:TPU compile permanent error.
+Ran out of memory in memory space hbm. Used 49.34G of 32.00G hbm.
+Exceeded hbm capacity by 17.34G.
+Total hbm usage >= 49.34G: reserved 3.12M program unknown size arguments 49.34G
+```
+
+```
+JaxRuntimeError: RESOURCE_EXHAUSTED: Ran out of memory in memory space vmem
+while allocating on stack for
+%ragged_latency_optimized_all_gather_lhs_contracting_gated_matmul_kernel.18 =
+bf16[2048,4096]{1,0:T(8,128)(2,1)} custom-call(...), custom_call_target=""
+```
+
+Each entry contains:
+
+| Part | Example | Meaning |
+|---|---|---|
+| Exception class | `XlaRuntimeError` | Surface where the error was raised |
+| gRPC status code | `RESOURCE_EXHAUSTED` | Category of failure |
+| Human-readable message | `Ran out of memory in memory space hbm` | What happened |
+| Structured context | `Used 49.34G of 32.00G hbm` | Quantitative detail for diagnosis |
+| HLO instruction | `%ragged_latency_optimized_...` | The specific operation that triggered the failure |
+
+## Error categories by code prefix
+
+XLA error codes follow a numeric scheme. The leading digit indicates the category:
+
+| Prefix | Category |
+|---|---|
+| `E01xx` | Runtime: allocation failures |
+| `E02xx` | Runtime: hardware / core faults |
+| `E1xxx` | Compile time: memory (HBM, VMEM) |
+| `E12xx` | Compile time: host offload |
+| `E2xxx` | Compile time: hardware capability |
+| `E3xxx` | Compile time: SparseCore |
+
+## Error code index
+
+<AccordionGroup>
+  <Accordion title="Runtime errors (E0xxx)">
+    | Code | Description |
+    |---|---|
+    | E0100 | Runtime: Buffer Allocation Failure |
+    | E0101 | Runtime: Program Allocation Failure |
+    | E0102 | Runtime: Program Input Buffer Mismatch |
+    | E0200 | Runtime: Core Halted Unexpectedly |
+  </Accordion>
+  <Accordion title="Compile time: memory (E1xxx)">
+    | Code | Description |
+    |---|---|
+    | E1000 | Compile Time: HBM OOM |
+    | E1001 | Compile Time: Scoped VMEM OOM |
+    | E1200 | Compile Time: Host Offload Output Mismatch |
+  </Accordion>
+  <Accordion title="Compile time: hardware capability (E2xxx)">
+    | Code | Description |
+    |---|---|
+    | E2001 | Compile Time: Unsupported RHS DataType on Hardware |
+    | E2002 | Compile Time: Mosaic Input/Output Misaligned Block and Tiling |
+    | E2003 | Compile Time: Mosaic Unproven Memory Access Alignment |
+  </Accordion>
+  <Accordion title="Compile time: SparseCore (E3xxx)">
+    | Code | Description |
+    |---|---|
+    | E3000 | Compile Time: SparseCore Allocation Failure |
+    | E3001 | Compile Time: SparseCore No Viable Logical Replica Count |
+  </Accordion>
+</AccordionGroup>
+
+## Common error patterns
+
+<AccordionGroup>
+  <Accordion title="RESOURCE_EXHAUSTED — memory">
+    The most frequent error class. Indicates HBM or VMEM was exhausted during compilation or runtime.
+
+    **Next steps:** See [Debugging OOM Errors](/debugging/oom-debugging) for mitigation strategies.
+  </Accordion>
+  <Accordion title="RESOURCE_EXHAUSTED — allocation at runtime">
+    Buffer or program allocation failed at runtime (E0100, E0101). The device could not satisfy an allocation request even though compilation succeeded.
+
+    **Next steps:** Check peak memory with XProf. Reduce model size or batch size.
+  </Accordion>
+  <Accordion title="Input buffer mismatch (E0102)">
+    The shapes or dtypes passed at runtime do not match what the compiled program expects.
+
+    **Next steps:** Verify that the input tensors match the shapes used at `jit` / compile time.
+  </Accordion>
+  <Accordion title="Core halted unexpectedly (E0200)">
+    A hardware core stopped during execution. This may indicate a hardware fault or a kernel that triggered undefined behavior.
+
+    **Next steps:** File a bug with an HLO dump and the full error log.
+  </Accordion>
+  <Accordion title="Unsupported operation (E2xxx)">
+    The hardware does not support the requested operation or data type configuration.
+
+    **Next steps:** Check the specific error code page for supported alternatives.
+  </Accordion>
+</AccordionGroup>
+
+## Related pages
+
+- [Debugging OOM Errors](/debugging/oom-debugging)
+- [HLO Dumps](/debugging/hlo-dumps)
+- [HLO Dumps](/debugging/hlo-dumps)

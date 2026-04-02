@@ -1,0 +1,78 @@
+---
+title: "Determinism in XLA"
+description: "Understand what affects deterministic execution in XLA and how to enforce reproducible results across runs using compiler flags."
+keywords: ["determinism", "reproducibility", "non-deterministic", "GPU", "autotuning", "scatter", "GEMM", "convolution"]
+---
+
+Determinism in XLA means that the same program, run multiple times with the same inputs, produces bit-identical outputs. XLA does not guarantee determinism by default because some operations have non-deterministic implementations that are faster than their deterministic equivalents.
+
+This page covers GPU-specific determinism. TPU execution is generally deterministic.
+
+## Sources of non-determinism
+
+Non-determinism in XLA GPU programs can come from two distinct sources: compilation choices and execution behavior.
+
+### Compilation non-determinism
+
+XLA uses autotuning to pick the fastest kernel implementation for each operation. Autotuning benchmarks multiple kernel candidates and selects the winner based on measured runtime. Because hardware measurements fluctuate, different autotuning runs can select different kernels — even with identical inputs. This means two compilation runs of the same program may produce different executables.
+
+### Execution non-determinism
+
+Several GPU operations have non-deterministic implementations by default:
+
+- Scatter
+- Select-and-scatter
+- GEMMs (matrix multiplications)
+- Convolutions
+- Multi-headed attention
+
+These operations use parallel reduction algorithms whose summation order is not fixed, producing results that vary due to floating-point non-associativity.
+
+## Enforcing determinism
+
+### Deterministic compilation with persisted autotuning
+
+Run autotuning once, persist the results, and require all subsequent compilations to reuse them:
+
+```sh
+--xla_gpu_require_complete_aot_autotune_results
+```
+
+With this flag set, a compilation that cannot find a compatible cached autotuning result will fail rather than re-autotuning. This ensures the same kernels are always selected.
+
+See [Persisted Autotuning](/internals/persisted-autotuning) for instructions on capturing and distributing autotuning results.
+
+### Deterministic execution
+
+```sh
+--xla_gpu_exclude_nondeterministic_ops
+```
+
+This flag switches the affected operations (scatter, GEMMs, convolutions, multi-headed attention) to deterministic but potentially slower implementations.
+
+<Warning>
+  `select-and-scatter` does not have a deterministic implementation. When `--xla_gpu_exclude_nondeterministic_ops` is set, compilation will **fail** if the program contains a `select-and-scatter` operation. Refactor the program to avoid this operation if you need determinism.
+</Warning>
+
+## Performance trade-offs
+
+| Requirement | Flags needed | Trade-off |
+|---|---|---|
+| Deterministic compilation only | `--xla_gpu_require_complete_aot_autotune_results` + persisted autotune cache | One-time autotuning cost; subsequent compilations are fast and stable |
+| Deterministic execution only | `--xla_gpu_exclude_nondeterministic_ops` | Operations like scatter and GEMM may be slower |
+| Fully deterministic (compile + execute) | Both flags above | Maximum reproducibility; highest potential performance cost |
+| Maximum performance (default) | None | Fastest execution; results may differ across runs |
+
+<Tip>
+  For production inference serving, use persisted autotuning to get both compilation stability and near-peak performance without sacrificing throughput.
+</Tip>
+
+## Floating-point considerations
+
+Even with deterministic ops enabled, results may not be numerically identical across different hardware generations or driver versions. Determinism here means bit-for-bit reproducibility on the **same hardware and driver**. Cross-hardware reproducibility is not guaranteed because different GPUs may use different fused multiply-add (FMA) instruction sequences.
+
+## Related pages
+
+- [Persisted Autotuning](/internals/persisted-autotuning)
+- [HLO Dumps](/debugging/hlo-dumps)
+- [XLA Errors Overview](/debugging/errors-overview)

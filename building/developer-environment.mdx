@@ -1,0 +1,106 @@
+---
+title: "Developer Environment Setup"
+description: "Configure LSP support with clangd, run layering checks, and remove unused BUILD dependencies before submitting a PR."
+---
+
+This guide covers tooling that makes working on XLA more productive and helps you pass the additional checks that XLA's internal CI runs before merging a PR.
+
+## LSP support with clangd
+
+Editors such as VS Code, Emacs, and Vim support code navigation, completion, and inline diagnostics through [LSP](https://en.wikipedia.org/wiki/Language_Server_Protocol). [clangd](https://clangd.llvm.org) is the recommended C++ language server. It requires a `compile_commands.json` file at the root of the project.
+
+### Generate compile\_commands.json
+
+Use the [`generate_compile_commands.py`](https://github.com/openxla/xla/blob/main/build_tools/lint/generate_compile_commands.py) script. Run the following command from the XLA repository root:
+
+```sh
+bazel aquery "mnemonic(CppCompile, //xla/...)" --output=jsonproto \
+  | python3 build_tools/lint/generate_compile_commands.py
+```
+
+This writes `compile_commands.json` in place at the repository root. Point your editor or language server at this file.
+
+### Editor setup
+
+<Tabs>
+  <Tab title="VS Code">
+    Install the [clangd extension](https://marketplace.visualstudio.com/items?itemName=llvm-vs-code-extensions.vscode-clangd). Once `compile_commands.json` exists at the repo root, clangd picks it up automatically. You may need to disable the default C/C++ IntelliSense provider to avoid conflicts.
+  </Tab>
+  <Tab title="Emacs">
+    Use [eglot](https://github.com/joaotavora/eglot) or [lsp-mode](https://emacs-lsp.github.io/lsp-mode/) with `clangd` as the server. Both packages discover `compile_commands.json` automatically when opened inside the project tree.
+  </Tab>
+  <Tab title="Vim / Neovim">
+    Use [vim-lsp](https://github.com/prabirshrestha/vim-lsp), [coc.nvim](https://github.com/neoclide/coc.nvim), or the built-in LSP client in Neovim (`nvim-lspconfig`). Configure `clangd` as the language server — it will locate `compile_commands.json` from the repo root.
+  </Tab>
+</Tabs>
+
+## Build cleaner
+
+XLA's internal CI at Google runs stricter dependency checks than the public OSS Bazel CI. Running these checks locally before opening a PR significantly reduces review round-trips: otherwise a Googler must fix the issues internally or request further changes over several review cycles.
+
+### Layering check
+
+Build with `--features=layering_check` to catch headers included via transitive dependencies that are not explicitly listed in the target's `deps`:
+
+```sh
+bazel build --features=layering_check //xla/...
+```
+
+Fix any reported violations by adding the missing direct dependencies to the relevant `BUILD` file entry.
+
+### Remove unused dependencies
+
+Two tools work together to identify and remove stale `deps` entries.
+
+<Steps>
+  <Step title="Install Buildozer">
+    ```sh
+    sudo curl -fsSL -o /usr/bin/buildozer \
+      https://github.com/bazelbuild/buildtools/releases/download/6.0.0/buildozer-linux-amd64
+    sudo chmod 755 /usr/bin/buildozer
+    ```
+  </Step>
+  <Step title="Install Bant">
+    Install to a user-writable directory (no root required):
+
+    ```sh
+    bazel build -c opt //bant && install -D --strip bazel-bin/bant/bant ~/bin/bant
+    ```
+
+    Or install system-wide:
+
+    ```sh
+    sudo install -D --strip bazel-bin/bant/bant /usr/local/bin/bant
+    ```
+  </Step>
+  <Step title="Generate buildozer commands for a target">
+    ```sh
+    bant dwyu //xla/core/collectives:symmetric_memory
+    ```
+
+    This prints the `buildozer` commands needed to remove unused deps from the target.
+  </Step>
+  <Step title="Apply the fixes">
+    Review and run the generated commands, or apply them all at once:
+
+    ```sh
+    . <(bant dwyu //xla/core/collectives:symmetric_memory)
+    ```
+
+    <Warning>
+      Piping directly into the shell applies all suggested removals without further confirmation. Review the output first if you are unsure about any of the suggested changes.
+    </Warning>
+  </Step>
+</Steps>
+
+## Pre-commit checklist
+
+Before opening a PR, verify the following:
+
+- `bazel build --features=layering_check //xla/...` passes with no new violations.
+- `bant dwyu` reports no unused deps for targets you have modified.
+- All new or modified targets have direct (not transitive) dependency declarations.
+
+<Tip>
+  Running these checks early avoids the most common reasons a Googler must make additional edits to your PR before it can be merged internally.
+</Tip>

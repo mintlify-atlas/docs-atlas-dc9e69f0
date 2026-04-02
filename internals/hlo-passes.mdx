@@ -1,0 +1,193 @@
+---
+title: "HLO Optimization Passes"
+description: "Compiler transformations that run on the HLO graph, organized by hardware target and analysis type."
+---
+
+## Introduction
+
+An HLO pass is a compiler transformation that operates on the HLO (High Level Optimizer) computation graph. A single pass can encompass one or many optimizations. XLA provides several hundred such passes covering arithmetic simplification, memory optimization, code legalization, and more.
+
+HLO passes work at the level of **shapes** (e.g., a `3x4` matrix) and [operation semantics](/reference/operation-semantics), without dealing with low-level machine instructions. This abstraction makes passes portable across hardware backends.
+
+<Note>
+All HLO passes inherit from `HloModulePass`, defined in `xla/hlo/pass/hlo_pass_interface.h`. Passes should **not** extend `HloPassInterface` directly.
+</Note>
+
+## Base Class: `HloModulePass`
+
+The base class for all transformation passes is `HloModulePass` (in `xla/hlo/pass/hlo_pass_interface.h`). It provides:
+
+- A `name()` method identifying the pass.
+- A `Run(HloModule*, execution_threads)` method that returns whether the module was modified.
+- Integration with `HloPassPipeline`, which sequences multiple passes and manages fixed-point iteration.
+
+```cpp
+// Example: extending HloModulePass
+class MyPass : public HloModulePass {
+ public:
+  absl::string_view name() const override { return "my-pass"; }
+  absl::StatusOr<bool> Run(
+      HloModule* module,
+      const absl::flat_hash_set<absl::string_view>& execution_threads) override;
+};
+```
+
+Passes are grouped and run in sequence by `HloPassPipeline`. The pipeline can run a pass repeatedly until a fixed point is reached using `HloPassFix`.
+
+## Tooling and Testing
+
+XLA ships the `hlo-opt` command-line tool for running individual passes in isolation, independent of the full compilation pipeline. See [Tools](/reference/tools) for usage.
+
+For writing pass unit tests, see [Testing HLO Passes](/reference/test-hlo-passes).
+
+## Hardware-Independent Passes
+
+Shared passes live in `xla/hlo/transforms/`. These run across all XLA backends.
+
+<AccordionGroup>
+  <Accordion title="AlgebraicSimplifier">
+    **File:** `xla/hlo/transforms/simplifiers/algebraic_simplifier.h`
+
+    A broad collection of arithmetic simplifications, optimizations, and canonicalizations — analogous to LLVM's `instcombine` pass.
+
+    Examples of transformations it applies:
+    - Division by a constant → multiplication by its inverse.
+    - Removal of redundant transpose/broadcast pairs.
+    - Simplification of identity operations (e.g., `x * 1`, `x + 0`).
+  </Accordion>
+
+  <Accordion title="HloRematerialization">
+    **File:** `xla/hlo/transforms/simplifiers/hlo_rematerialization.h`
+
+    Selectively recomputes expressions in the HLO graph to reduce memory pressure caused by long live ranges of array-shaped values. Trades higher compute for lower memory usage, and is required to run many large models.
+
+    Can reduce peak memory usage by tens of percent.
+  </Accordion>
+
+  <Accordion title="HloConstantFolding">
+    **File:** `xla/hlo/transforms/simplifiers/hlo_constant_folding.h`
+
+    Replaces sub-expressions that can be fully evaluated at compile time with their constant equivalent. For example, `constant(2) * constant(3)` becomes `constant(6)`.
+  </Accordion>
+
+  <Accordion title="HloDCE (Dead Code Elimination)">
+    **File:** `xla/hlo/transforms/simplifiers/hlo_dce.h`
+
+    Removes HLO operations whose results are never used. This is a fast implementation that walks the graph and prunes unreachable nodes.
+  </Accordion>
+
+  <Accordion title="FlattenCallGraph">
+    **File:** `xla/hlo/transforms/simplifiers/flatten_call_graph.h`
+
+    A legalization pass that converts the HLO call graph into a tree by cloning computations. Required because XLA statically assigns memory to HLO operations based on position in the graph, not dynamic call context.
+  </Accordion>
+
+  <Accordion title="ReshapeMover">
+    **File:** `xla/hlo/transforms/simplifiers/reshape_mover.h`
+
+    Moves reshapes and transposes across elementwise operations in the graph. Enables those reshapes to be merged or eliminated entirely. Particularly important on TPU, where reshapes and transposes can be expensive.
+  </Accordion>
+
+  <Accordion title="ZeroSizedHloElimination">
+    **File:** `xla/hlo/transforms/simplifiers/zero_sized_hlo_elimination.h`
+
+    HLO supports arrays with one or more zero-sized dimensions. This pass replaces zero-sized operations with zero-sized constants, simplifying the graph.
+  </Accordion>
+</AccordionGroup>
+
+## TPU-Specific Passes
+
+These passes are part of the TPU backend pipeline.
+
+<AccordionGroup>
+  <Accordion title="ShardingPropagation (Model Parallelism)">
+    **File:** `xla/service/sharding_propagation.h`
+
+    Supports dividing HLO operations across multiple TPU cores along non-batch dimensions (spatial partitioning). Part of XLA's SPMD (Single Program Multiple Data) infrastructure, this pass propagates sharding annotations through the graph.
+  </Accordion>
+
+  <Accordion title="BFloat16 Handling Passes">
+    **Files:**
+    - `BFloat16ConversionFolding` — `xla/hlo/transforms/simplifiers/bfloat16_conversion_folding.h`
+    - `BFloat16MixedPrecisionRemoval` — `xla/hlo/transforms/simplifiers/float_normalization.h`
+    - `BFloat16Propagation` — `xla/hlo/transforms/bfloat16_propagation.h`
+
+    TPUs support `bfloat16` as a compact, lower-precision float format (compared to `float32`). These passes replace floats with `bfloat16` throughout the program and propagate the precision change through the graph, reducing memory footprint and bandwidth.
+  </Accordion>
+
+  <Accordion title="Legalization Passes">
+    **Files:**
+    - `GatherExpander` — `xla/service/gather_expander.h`
+    - `BatchNormExpander` — `xla/service/batchnorm_expander.h`
+
+    These passes transform HLO operations that the TPU backend cannot emit directly into equivalent forms that it can lower efficiently. Legalization is often required when an op is not natively supported by the hardware.
+  </Accordion>
+</AccordionGroup>
+
+## GPU-Specific Passes
+
+GPU passes live in `xla/service/gpu/` and are defined in `namespace gpu`.
+
+<AccordionGroup>
+  <Accordion title="CudnnFusedConvRewriter">
+    **File:** `xla/service/gpu/transforms/cudnn_fused_conv_rewriter.h`
+
+    Rewrites fused convolution operations in the HLO graph into corresponding library calls in cuDNN. This allows XLA to delegate these operations to NVIDIA's highly optimized convolution implementations.
+  </Accordion>
+
+  <Accordion title="CudnnNormRewriter">
+    **File:** `xla/service/gpu/transforms/cudnn_norm_rewriter.h`
+
+    Rewrites normalization operations (e.g., layer norm patterns) into cuDNN library calls, enabling GPU-optimized execution.
+  </Accordion>
+</AccordionGroup>
+
+## CPU-Specific Passes
+
+CPU passes live in `xla/service/cpu/` and are defined in `namespace cpu`.
+
+<AccordionGroup>
+  <Accordion title="ConvCanonicalization">
+    **File:** `xla/service/cpu/conv_canonicalization.h`
+
+    Canonicalizes convolution operations so that they can be lowered to a fast implementation in [Eigen](https://eigen.tuxfamily.org/), XLA's CPU linear algebra library.
+  </Accordion>
+
+  <Accordion title="ParallelTaskAssigner">
+    **File:** `xla/service/cpu/parallel_task_assignment.h`
+
+    Partitions HLO operations into tasks that can run on separate threads, enabling parallel execution on multi-core CPUs.
+  </Accordion>
+</AccordionGroup>
+
+## Analysis Passes
+
+Analysis passes are distinct from transformation passes — they inspect the HLO graph and produce information used by other passes or the compiler backend. They do **not** modify HLO and may not extend `HloModulePass`.
+
+Shared analyses are in `xla/hlo/analysis/`.
+
+<AccordionGroup>
+  <Accordion title="HloDataflowAnalysis">
+    **File:** `xla/hlo/analysis/hlo_dataflow_analysis.h`
+
+    Identifies all HLO values in the computation graph and tracks where each value is defined and used. This is a foundational analysis used by many other passes.
+  </Accordion>
+
+  <Accordion title="HloAliasAnalysis">
+    **File:** `xla/hlo/analysis/hlo_alias_analysis.h`
+
+    Identifies must-alias relationships between values in the program. Used by buffer assignment to determine when two buffers can safely share the same memory.
+  </Accordion>
+
+  <Accordion title="HloCostAnalysis">
+    **File:** `xla/service/hlo_cost_analysis.h`
+
+    Computes FLOP counts and memory usage estimates for all operations in the program. Used by the fusion cost model and scheduler.
+  </Accordion>
+
+  <Accordion title="HloVerifier">
+    **File:** `xla/service/hlo_verifier.h`
+
+    Verifies various structural and type invariants of the HLO graph. Run after passes to catch malformed IR early. Not a transformation pass.
+  </Accordion>
+</AccordionGroup>

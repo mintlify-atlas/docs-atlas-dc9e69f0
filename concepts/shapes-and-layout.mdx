@@ -1,0 +1,167 @@
+---
+title: "Shapes and Layout"
+description: "How XLA describes tensor shapes, memory layouts, tiling formats, and memory space identifiers in HLO programs."
+---
+
+Every value produced by an XLA operation has a **shape** — a dtype and a set of dimension sizes — and a **layout** describing how that shape is stored in memory. Understanding both is essential for reading HLO dumps and tuning performance.
+
+## Structure of an XLA op
+
+An HLO instruction encodes several pieces of information in a single line. Consider:
+
+```hlo
+add.936 = bf16[8,1,1280,16384]{3,2,0,1:T(8,128)(2,1)} add(exponential.183, broadcast.3115)
+```
+
+| Component | Value | Description |
+|-----------|-------|-------------|
+| Op name | `add.936` | Unique name for this instruction |
+| Shape | `bf16[8,1,1280,16384]` | Output dtype (`bf16`) and dimension sizes |
+| Layout | `{3,2,0,1:T(8,128)(2,1)}` | Dimension ordering and tiling |
+| Operation | `add` | The HLO operation being performed |
+| Arguments | `exponential.183`, `broadcast.3115` | Named inputs |
+
+A more complex example — a fusion op — includes additional fields:
+
+```hlo
+%fusion.3 = bf16[32,32,4096]{2,1,0:T(8,128)(2,1)S(1)}
+            fusion(bf16[32,32,8192]{2,1,0:T(8,128)(2,1)S(1)} %fusion.32),
+            kind=kCustom, calls=%all-reduce-scatter.3
+```
+
+Here the output shape includes `S(1)`, a memory space identifier, and the input argument `%fusion.32` has its own inline shape annotation. The `kind` and `calls` attributes give additional information about the fusion.
+
+## Shapes
+
+A shape is defined by the `ShapeProto` message in [`xla_data.proto`](https://github.com/openxla/xla/tree/main/xla/xla_data.proto). It specifies:
+
+- **dtype** — the element type, e.g. `f32`, `bf16`, `s32`, `pred`
+- **dimensions** — the size along each axis, e.g. `[8, 1, 1280, 16384]`
+
+### Dimension numbering
+
+Dimensions are numbered from `0` to `N-1`. By convention they are listed in increasing dimension-number order:
+
+- A `3D` array of size `[A, B, C]` has dimension `0` of size `A`, dimension `1` of size `B`, dimension `2` of size `C`.
+- Some XLA utilities accept Python-style negative indexing: dimension `-1` is `N-1`.
+
+<Note>
+XLA previously used "rank" to mean the number of dimensions in an array. This usage is being phased out because it conflicts with the linear-algebra concept of matrix rank. Prefer "number of dimensions" in new code and documentation.
+</Note>
+
+Common letter conventions for small arrays:
+
+| Dimensions | Letters (dim 0 → dim N-1) |
+|------------|--------------------------|
+| 2D | `y`, `x` |
+| 3D | `z`, `y`, `x` |
+| 4D | `p`, `z`, `y`, `x` |
+
+### Creating shapes with XlaBuilder
+
+The `ShapeUtil` helpers let you construct shapes in C++:
+
+```cpp
+// Creates shape f32[A, B, C, D]
+ShapeUtil::MakeShape(F32, {A, B, C, D})
+```
+
+Arguments are always listed in increasing dimension-number order, matching the `initializer_list` convention.
+
+## Layout
+
+A layout is described by the `LayoutProto` message and specifies how the logical shape maps to linear memory.
+
+### Minor-to-major dimension ordering
+
+The `minor_to_major` field lists dimension numbers from most-minor (changes fastest in memory) to most-major (changes slowest). For a shape with `N` dimensions the field contains a permutation of `[0, N-1]`.
+
+<Tabs>
+  <Tab title="Column-major (dim 0 minor)">
+    For `minor_to_major = [0, 1]` on a `[2, 3]` array:
+
+    ```
+    Logical:        Linear memory:
+    a b c           a d b e c f
+    d e f
+    ```
+
+    Dimension 0 varies fastest — this is column-major order.
+  </Tab>
+  <Tab title="Row-major (dim 0 major)">
+    For `minor_to_major = [1, 0]` on the same `[2, 3]` array:
+
+    ```
+    Logical:        Linear memory:
+    a b c           a b c d e f
+    d e f
+    ```
+
+    Dimension 1 varies fastest — this is row-major order.
+  </Tab>
+</Tabs>
+
+The default layout for newly created shapes is major-to-minor (`[N-1, ..., 0]`), equivalent to row-major for 2D arrays.
+
+### Tiling
+
+Tiling breaks a shape into fixed-size rectangular tiles that are then laid out in memory. The notation `T(t0, t1, ...)` appended after the dimension ordering specifies the tile sizes.
+
+```hlo
+-- Layout {2,1,0:T(8,128)(2,1)} means:
+--   - dimension ordering: 2 is most-minor, 0 is most-major
+--   - first tiling:  8 rows × 128 columns
+--   - second tiling: 2 rows × 1 column  (BF16 packing)
+```
+
+<AccordionGroup>
+  <Accordion title="Common TPU tile formats">
+    | Format | Tiling | Description |
+    |--------|--------|-------------|
+    | Untiled | (none) | Standard linear layout, used on CPU/GPU |
+    | TPU standard | `T(8,128)` | Matches 32-bit `8×128` vector registers |
+    | TPU small 2nd-minor | `T(2,128)` | Used when 2nd-minor dimension is 1 or 2 |
+    | TPU BF16 | `T(8,128)(2,1)` | Two-level tiling that packs two 16-bit values into one 32-bit slot |
+    | TPU INT8 | `T(8,128)(4,1)` | Four-level packing for 8-bit values |
+  </Accordion>
+  <Accordion title="How repeated tiling works">
+    A shape like `F32[3,5]{1,0:T(2,2)}` is tiled with 2×2 tiles:
+
+    1. The array is padded to the next multiple of the tile size in each dimension.
+    2. Tiles cover the padded array left-to-right, top-to-bottom.
+    3. Within each tile, elements are stored in row-major order.
+    4. Padding elements (white in diagrams) hold undefined values.
+
+    For BF16 the second-level tiling `(2,1)` collects one element from an even row and one from an odd row into a single 32-bit word, matching TPU's native register format.
+  </Accordion>
+  <Accordion title="Tail padding alignment">
+    The `tail_padding_alignment_in_elements` field in `LayoutProto` pads the end of the tiled array until its total element count is a multiple of the specified value. This satisfies alignment requirements of the underlying hardware.
+  </Accordion>
+</AccordionGroup>
+
+### Indexing utilities
+
+The `IndexUtil` class in [`index_util.h`](https://github.com/openxla/xla/tree/main/xla/index_util.h) converts between multidimensional indices and linear indices given a shape and layout. Additional helpers are in `shape_util.h` and `layout_util.h`.
+
+## Memory space identifiers
+
+Each array in HLO can carry a memory space annotation written as `S(n)`:
+
+| Identifier | Memory location |
+|-----------|----------------|
+| `S(0)` | Device high-bandwidth memory (HBM) — the default, usually omitted |
+| `S(1)` | On-device virtual memory (VMEM) on a TPU |
+| `S(2)`, `S(3)`, ... | Additional device-specific memory spaces |
+| `S(5)` | Host memory |
+
+In the fusion example above, `S(1)` indicates the output lives in VMEM rather than HBM.
+
+<Tip>
+When profiling, memory space identifiers tell you where data resides during a computation. Moving data between `S(0)` (HBM) and `S(1)` (VMEM) has a latency cost that can dominate kernel runtime for memory-bound ops.
+</Tip>
+
+## Related topics
+
+- [Tiled Layout](/concepts/shapes-and-layout) — deep dive into the linear index formulas for tiled formats
+- [Broadcasting](/concepts/broadcasting) — how XLA reconciles shapes with different ranks or sizes
+- [Indexing Analysis](/concepts/indexing-analysis) — how element-level index maps relate tensor shapes across ops

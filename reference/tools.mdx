@@ -1,0 +1,315 @@
+---
+title: "XLA Tools"
+description: "Command-line tools for running, optimizing, and debugging XLA HLO programs: run_hlo_module, hlo-opt, ptx-opt, isolate_hlo, and more."
+keywords: ["XLA", "tools", "run_hlo_module", "hlo-opt", "HLO", "debugging", "compilation"]
+---
+
+The XLA development workflow is centered around
+[HLO (High-Level Operations)](/reference/operation-semantics) IR, which represents isolated
+functional computation given to the compiler. XLA ships several command-line tools that
+consume HLO and either run it or provide intermediate compilation stages.
+
+Using these tools enables a fast `compile → modify → run` iteration cycle. HLO is both
+visualizable and hackable, and iteratively changing and running it is often the fastest
+way to understand and fix XLA performance or correctness issues.
+
+## Obtaining HLO dumps
+
+The easiest way to obtain HLO for a program being compiled with XLA is the `XLA_FLAGS`
+environment variable:
+
+```bash
+XLA_FLAGS=--xla_dump_to=/tmp/myfolder ./myprogram-entry-point
+```
+
+This stores all before-optimization HLO files in the specified folder, along with many
+other useful artifacts.
+
+---
+
+## run_hlo_module
+
+Runs HLO modules with compilation, execution, and optional correctness checking.
+
+```bash
+bazel run //xla/tools:run_hlo_module -- [flags] <filename>
+```
+
+`run_hlo_module` operates on pre-optimization HLO and by default bundles compilation,
+running, and comparison with the reference interpreter implementation.
+
+### Basic usage
+
+Run a module on NVIDIA GPU and check for correctness against the interpreter:
+
+```bash
+run_hlo_module --platform=CUDA --reference_platform=Interpreter computation.hlo
+```
+
+### Running multiple modules
+
+Run all HLO modules from a directory:
+
+```bash
+bazel run //xla/tools:run_hlo_module -- [flags] /dump/*before_optimizations*
+```
+
+<Tip>
+The biggest file in a dump directory is usually the most interesting one, as it corresponds
+to the main computation module.
+</Tip>
+
+---
+
+## hlo-opt
+
+A multi-purpose tool for compiling, optimizing, and converting HLO modules.
+
+### Compile HLO to a specific stage
+
+```bash
+bazel run //xla/tools:hlo-opt -- --platform=[gpu|cpu|...] [flags] <filename>
+```
+
+`hlo-opt` supports multiple output stages. The available stages depend on the platform:
+
+```bash
+hlo-opt --platform=CUDA --list-stages
+```
+
+```
+buffer-assignment
+hlo
+hlo-backend
+html
+llvm
+llvm-after-optimizations
+llvm-before-optimizations
+ptx
+```
+
+Write the result of a stage to stdout (or to a file with `-o`):
+
+```bash
+hlo-opt --platform=cpu --stage=hlo input.hlo
+```
+
+### Deviceless GPU compilation
+
+Compile for GPU without needing a physical GPU device. Provide a GPU spec file instead:
+
+```bash
+hlo-opt --platform=CUDA --stage=llvm \
+  --xla_gpu_target_config_filename=/xla/tools/hlo_opt/gpu_specs/a100_pcie_80.txtpb \
+  input.hlo
+```
+
+GPU spec files are text serializations of `device_description.proto`:
+
+```
+gpu_device_info {
+  cuda_compute_capability {
+    major: 8
+    minor: 0
+  }
+  threads_per_block_limit: 1024
+  threads_per_warp: 32
+  shared_memory_per_block: 127152
+  shared_memory_per_core: 65536
+  threads_per_core_limit: 2048
+  core_count: 6192
+  memory_bandwidth: 2039000000000
+  l2_cache_size: 4194304
+  clock_rate_ghz: 1.1105
+  device_memory_size: 79050250240
+}
+platform_name: "CUDA"
+```
+
+Specs for popular GPUs are available at `/xla/tools/hlo_opt/gpu_specs/`.
+
+#### Handling autotuning
+
+Deviceless compilation requires either disabling autotuning or providing cached results:
+
+```bash
+# Option 1: Disable autotuning
+hlo-opt --platform=CUDA --stage=llvm \
+  --xla_gpu_target_config_filename=gpu_specs/a100_pcie_80.txtpb \
+  --xla_gpu_autotune_level=0 \
+  input.hlo
+
+# Option 2: Load cached autotuning results
+hlo-opt --platform=CUDA --stage=llvm \
+  --xla_gpu_target_config_filename=gpu_specs/a100_pcie_80.txtpb \
+  --xla_gpu_load_autotune_results_from=results.textpb \
+  input.hlo
+```
+
+Serialize an autotuning database with:
+
+```bash
+XLA_FLAGS=--xla_gpu_dump_autotune_results_to=myfile.pbtxt ./myprogram
+```
+
+### HLO pass development and debugging
+
+For hardware-independent passes in `xla/hlo/transforms/`, use the lightweight version:
+
+```bash
+bazel run //xla/hlo/tools:hlo-opt -- [flags] <filename>
+
+# For CPU/GPU passes, use the full version:
+bazel run //xla/tools:hlo-opt -- [flags] <filename>
+```
+
+Run a specific pass in isolation:
+
+```bash
+hlo-opt --passes=schedule-aware-collective-cse input.hlo
+```
+
+Run multiple passes as a custom pipeline:
+
+```bash
+hlo-opt --passes=pass1,pass2,pass3 input.hlo
+```
+
+Pass XLA debug options alongside passes:
+
+```bash
+hlo-opt --passes=schedule-aware-collective-cse \
+  --xla_gpu_experimental_collective_cse_distance_threshold=20 \
+  input.hlo
+```
+
+List all available passes:
+
+```bash
+hlo-opt --list-passes
+```
+
+### Measuring pass runtime
+
+For large models, isolating individual passes makes it easy to detect performance regressions:
+
+```bash
+time hlo-opt --passes=reduce-window-rewriter,scatter_simplifier \
+  --xla_reduce_window_rewrite_base_length=128 \
+  input.hlo
+```
+
+### Registering a new pass with hlo-opt
+
+<Steps>
+  <Step title="Write your pass">
+    Implement the HLO pass following the XLA pass interface.
+  </Step>
+  <Step title="Register the pass">
+    Add pass registration to the appropriate file:
+
+    ```cpp
+    RegisterPass<FooPass>(FooPassInputOptions)
+    ```
+
+    Choose the location based on pass type:
+    - [`opt_lib.cc`](https://github.com/openxla/xla/blob/main/xla/hlo/tools/hlo_opt/opt_lib.cc) — hardware-independent passes
+    - [`cpu_opt.cc`](https://github.com/openxla/xla/blob/main/xla/tools/hlo_opt/cpu_opt.cc) — CPU-specific passes
+    - [`gpu_opt.cc`](https://github.com/openxla/xla/blob/main/xla/tools/hlo_opt/gpu_opt.cc) — GPU-specific passes
+    - [`compiled_opt.cc`](https://github.com/openxla/xla/blob/main/xla/tools/hlo_opt/compiled_opt_lib.cc) — passes common to CPU, GPU, XPU
+  </Step>
+  <Step title="Rebuild and verify">
+    Rebuild `hlo-opt`, verify registration with `--list-passes`, then run your pass:
+
+    ```bash
+    hlo-opt --passes=foo-pass input.hlo
+    ```
+  </Step>
+</Steps>
+
+### Converting between HLO formats
+
+```bash
+# Use the lightweight hlo-opt for format conversion:
+bazel run //xla/hlo/tools:hlo-opt -- [flags] <filename>
+
+# HLO Text → HLO Proto
+hlo-opt --emit-proto input.hlo
+
+# HLO Proto or HLO Proto Binary → HLO Text
+hlo-opt input.pbtxt
+hlo-opt input.pb
+```
+
+---
+
+## ptx-opt
+
+Compiles an LLVM module down to PTX (NVIDIA GPU assembly).
+
+```bash
+bazel run //xla/hlo/tools/ptx-opt -- --arch=9.0 <filename>
+```
+
+Dump LLVM IR after each optimization pass:
+
+```bash
+bazel run //xla/hlo/tools/ptx-opt -- \
+  --arch=9.0 \
+  --xla_dump_to=<path> \
+  --xla_gpu_dump_llvmir \
+  <filename>
+```
+
+---
+
+## isolate_hlo
+
+Extracts a single HLO instruction (and its necessary context) from a large HLO dump into
+a new, smaller HLO module. This is useful for creating minimal compiler-level reproducers
+when you suspect a specific instruction is causing a crash.
+
+```bash
+./build/tools/isolate_hlo \
+  --input=module.hlo \
+  --instruction_name=fusion.123 \
+  --output=isolated_fusion.123.hlo \
+  --input_format=txt \
+  --output_format=long_txt
+```
+
+The tool is available in `xla/tools/`. Run `--help` for all available flags.
+
+---
+
+## Multi-host HLO runner
+
+For HLO programs with SPMD sharding annotations, use the multi-host HLO runner.
+See [Multi-Host HLO Runner](/reference/multihost-hlo-runner) for details.
+
+```bash
+bazel run //xla/tools/multihost_hlo_runner:hlo_runner_main -- [flags] <filename>
+```
+
+---
+
+## XLA_FLAGS reference
+
+The `XLA_FLAGS` environment variable controls compiler behavior and enables diagnostics:
+
+| Flag | Description |
+| ---- | ----------- |
+| `--xla_dump_to=<dir>` | Dump HLO and other artifacts to a directory |
+| `--xla_gpu_dump_autotune_results_to=<file>` | Save autotuning results to a file |
+| `--xla_gpu_load_autotune_results_from=<file>` | Load cached autotuning results |
+| `--xla_gpu_autotune_level=0` | Disable autotuning entirely |
+| `--xla_disable_all_hlo_passes` | Skip all HLO optimization passes |
+
+```bash
+# Example: dump HLO and save autotuning results
+XLA_FLAGS="--xla_dump_to=/tmp/dump --xla_gpu_dump_autotune_results_to=/tmp/autotune.pbtxt" \
+  ./myprogram
+```
+
+For the full list of XLA debug options, see
+[`xla.proto`](https://github.com/openxla/xla/blob/main/xla/xla.proto).

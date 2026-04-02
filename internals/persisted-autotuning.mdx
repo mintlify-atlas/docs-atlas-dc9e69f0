@@ -1,0 +1,157 @@
+---
+title: "Persisted Autotuning"
+description: "How XLA caches and reuses autotuning results for GPU kernel parameters across compilation runs."
+---
+
+## What Is Autotuning?
+
+XLA:GPU uses [OpenAI Triton](https://github.com/openai/triton) to generate GPU kernels for certain HLO fusions, particularly GEMM (matrix multiplication) and softmax fusions. Triton is highly parameterized: tile sizes (`block_m`, `block_n`, `block_k`), number of pipeline stages, and warp counts must all be tuned for each fusion to achieve near-roofline performance.
+
+Autotuning searches for the optimal parameter configuration by benchmarking candidate configurations at compile time. This can take a long time when a model has many distinct fusions.
+
+**Persisted autotuning** solves this by caching autotuning results to disk, so that subsequent compilations can skip the search for fusions already seen.
+
+<Note>
+Autotuning is GPU-only. The autotuning step runs as part of the post-layout-assignment optimization phase in the XLA:GPU pipeline. See [HLO to Thunks](/internals/hlo-to-thunks) for where it fits.
+</Note>
+
+## How the Cache Works
+
+XLA computes a fingerprint (key) for each HLO fusion to be autotuned. On a cache hit, the stored parameter configuration is used directly. On a cache miss, XLA benchmarks the candidate configurations and stores the winner.
+
+The cache stores **one entry per distinct fusion**. Partial caches are valid: fusions present in the cache use cached results, while new fusions are autotuned normally.
+
+<Warning>
+Cache entries are hardware-specific. A cache built on an A100 GPU should not be used on an H100 or V100 without regeneration.
+</Warning>
+
+## Recommended: Per-Fusion Cache Directory
+
+```bash
+--xla_gpu_per_fusion_autotune_cache_dir=your/directory
+```
+
+This approach maintains a persistent cache directory with **one file per distinct fusion**. The cache grows incrementally across multiple XLA runs, even across different models.
+
+**Advantages:**
+- Shared across multiple models and runs.
+- Supports concurrent XLA instances with basic coordination.
+- XLA reads results when needed and writes new results after they are determined.
+
+**Requirements and limitations:**
+
+| Requirement | Notes |
+|-------------|-------|
+| Directory must exist and be writable before running XLA | XLA will not create the directory |
+| Cache invalidation is the user's responsibility | Use an empty directory to start fresh |
+| XLA version compatibility is the user's responsibility | Use separate directories for different XLA versions |
+| Not guaranteed to work alongside the file-based method | Do not combine with `--xla_gpu_dump_autotune_results_to` |
+
+The cache is **off by default** — no caching occurs unless the flag is provided.
+
+## Alternative: Single-File Dump and Load
+
+For simpler use cases or CI workflows, autotuning results can be exported and imported as a single file:
+
+```bash
+# Dump results after compilation:
+--xla_gpu_dump_autotune_results_to=/path/to/autotune_cache.textproto
+
+# Load results before compilation:
+--xla_gpu_load_autotune_results_from=/path/to/autotune_cache.textproto
+```
+
+The file format is determined by extension:
+- `.txt` or `.textproto` → text protobuf format (human-readable).
+- Any other extension → binary protobuf format.
+
+<Tip>
+The text protobuf format is useful for inspecting cache contents or committing them to source control.
+</Tip>
+
+## Using Persisted Autotuning in Tests
+
+Persisted autotuning is valuable in large test suites, especially in resource-constrained CI environments where GPU autotuning would be slow. It is recommended whenever tests are big or the test GPU performance is limited.
+
+<Note>
+The autotune cache must be generated on the same GPU type that will be used to run the tests.
+</Note>
+
+### Step-by-Step: Adding Autotuning Cache to a Test
+
+<Steps>
+  <Step title="Export the autotune cache from the test">
+    Run the test with autotuning enabled and dump the cache. Disable test sharding to ensure a single complete cache file:
+
+    ```bash
+    --test_env=XLA_FLAGS=--xla_gpu_dump_autotune_results_to=TEST_UNDECLARED_OUTPUTS_DIR/autotune_cache.textproto
+    --test_sharding_strategy=disabled
+    ```
+  </Step>
+  <Step title="Upload the cache to the repository">
+    Commit the generated `.textproto` file alongside the test source code.
+  </Step>
+  <Step title="Configure the test BUILD target to use the cache">
+    Add the cache as a data dependency and load it via an environment variable:
+
+    ```python
+    # In your BUILD file:
+    xla_cc_test(
+        name = "my_test",
+        ...
+        data = ["test_autotune_cache.textproto"],
+        env = {
+            "XLA_FLAGS": "--xla_gpu_load_autotune_results_from=" +
+                         "$(execpath test_autotune_cache.textproto)"
+        },
+    )
+    ```
+
+    Tests that load autotuning results can use test sharding normally.
+  </Step>
+</Steps>
+
+### Example Tests
+
+The XLA repository includes several reference tests in `xla/service/gpu/tests/BUILD`:
+
+- `load_autotune_results_using_execpath_test`
+- `load_autotune_results_from_test_workspace_test`
+- `dump_autotune_results_to_test_outputs_test`
+
+## Cache Obsolescence
+
+A cached autotuning result may become stale in these situations:
+
+| Cause | Action |
+|-------|--------|
+| Significant model changes (new fusions not in cache) | Regenerate the cache |
+| Switching to a new GPU type | Regenerate the cache on the new hardware |
+| XLA compiler updates that generate different fusions | Regenerate the cache |
+
+If a test becomes slow despite using a cached autotuning file, the cache is likely missing entries for new fusions introduced by model or compiler changes. Regenerate following the steps above.
+
+## Autotuned Parameters
+
+For Triton GEMM fusions, the autotuner searches over configurations including:
+
+```json
+{
+  "block_m": "64",
+  "block_n": "64",
+  "block_k": "64",
+  "split_k": "1",
+  "num_stages": "2",
+  "num_warps": "4"
+}
+```
+
+These values appear in the `backend_config` of the optimized HLO and control how the matmul is tiled across the GPU's thread hierarchy.
+
+## Summary of XLA Flags
+
+| Flag | Purpose |
+|------|---------|
+| `--xla_gpu_per_fusion_autotune_cache_dir` | Enable per-fusion cache directory (recommended) |
+| `--xla_gpu_dump_autotune_results_to` | Dump all autotune results for the current run to a file |
+| `--xla_gpu_load_autotune_results_from` | Load autotune results from a previously dumped file |

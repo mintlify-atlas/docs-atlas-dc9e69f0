@@ -1,0 +1,224 @@
+---
+title: "Multi-Host HLO Runner"
+description: "Run HLO modules across multiple GPUs and multiple hosts with SPMD sharding support using the multihost_hlo_runner tool."
+keywords: ["XLA", "multihost", "HLO runner", "SPMD", "multi-GPU", "distributed", "MPI", "SLURM"]
+---
+
+The multi-host HLO runner (`hlo_runner_main`) lets you run an HLO module on one or more GPUs,
+including across multiple hosts. It also supports compile-only mode for validating HLO without
+executing it.
+
+```bash
+# Binary name is hlo_runner_main
+bazel run //xla/tools/multihost_hlo_runner:hlo_runner_main -- [flags] <filename>
+```
+
+<Note>
+The multi-host HLO runner is a superset of `run_hlo_module`. Use it when your HLO contains
+`sharding=` annotations or when you need cross-host execution. See also [XLA Tools](/reference/tools)
+for the simpler single-device runner.
+</Note>
+
+## SPMD sharding support
+
+Multi-GPU (sharded) HLOs can be identified by `sharding=` annotations. For example:
+
+```
+sharding={devices=[1,1,2,1]0,1}
+```
+
+This annotation means the tensor should be sharded across 2 GPUs (GPU0 and GPU1) along
+the 3rd dimension.
+
+## Running a sharded HLO
+
+The following examples assume the working directory is the XLA Git repository and that
+`./configure.py` has been run.
+
+### Single process, multiple GPU
+
+```bash
+bazel run //xla/tools/multihost_hlo_runner:hlo_runner_main -- my-hlo.txt
+```
+
+### Compile-only (no execution)
+
+Compile without running — useful for validation when you don't have enough GPUs,
+especially when combined with an [autotuning cache](/internals/persisted-autotuning):
+
+```bash
+bazel run //xla/tools/multihost_hlo_runner:hlo_runner_main -- --run=false my-hlo.txt
+```
+
+### Running multiple modules
+
+Similar to `run_hlo_module`, the multi-host runner supports multiple modules:
+
+```bash
+bazel run //xla/tools/multihost_hlo_runner:hlo_runner_main -- \
+  [flags] /dump/*before_optimizations*
+```
+
+## Key flags
+
+| Flag | Description |
+| ---- | ----------- |
+| `--run=false` | Compile only, do not execute |
+| `--run_xla_backend_only` | Skip HLO optimization passes (required for post-optimization HLO) |
+| `--xla_disable_all_hlo_passes` | Skip all HLO passes (alternative to `--run_xla_backend_only`) |
+| `--hlo_argument_mode=uninitialized` | Skip input generation (faster, less memory) |
+| `--dynamic_mode=off` | Disable dynamic shapes (use if the runner crashes) |
+| `--task_id=<id>` | Process rank for multi-process runs |
+| `--num_nodes=<n>` | Total number of processes for multi-process runs |
+| `--address=<host:port>` | Coordination address for multi-process runs |
+
+<Warning>
+When replaying post-optimization HLO, you must use either `--xla_disable_all_hlo_passes`
+or `--run_xla_backend_only`. Running the optimizer again on already-optimized HLO will
+produce errors.
+</Warning>
+
+## Complete examples
+
+### Single process: before-optimization replay
+
+<Steps>
+  <Step title="Dump HLO from your model">
+
+    ```bash
+    # 8 GPUs with XLA_FLAGS to dump HLO
+    (export XLA_FLAGS="--xla_dump_to=/tmp/dump"; test-pax.sh --fsdp 8 --batch-per-gpu 1)
+
+    # Find the largest file (usually the main computation)
+    ls -lSh /tmp/dump/*before_optimizations.txt
+    ```
+
+    You can use a container with pre-installed dependencies:
+
+    ```bash
+    docker run -it --shm-size=1g --gpus all ghcr.io/nvidia/jax:pax-2024-06-03
+    cd /opt/xla/
+    ```
+
+  </Step>
+  <Step title="Build the runner">
+
+    ```bash
+    cd /opt/xla/
+    ./configure.py --backend CUDA --nccl
+    bazel build //xla/tools/multihost_hlo_runner:hlo_runner_main
+    ```
+
+  </Step>
+  <Step title="Run the HLO module">
+
+    ```bash
+    bazel run //xla/tools/multihost_hlo_runner:hlo_runner_main -- \
+      /tmp/dump/module_0023.pjit__wrapped_step_fn.before_optimizations.txt
+    ```
+
+  </Step>
+</Steps>
+
+### Single process: after-optimization replay
+
+```bash
+bazel run //xla/tools/multihost_hlo_runner:hlo_runner_main -- \
+  --run_xla_backend_only \
+  /tmp/dump/module_0023.pjit__wrapped_step_fn.sm_8.0_gpu_after_optimizations.txt
+```
+
+### Multi-process, single node (MPI)
+
+<Steps>
+  <Step title="Set up the environment">
+
+    ```bash
+    docker run -it --shm-size=1g --gpus all ghcr.io/nvidia/jax:pax-2024-06-03
+    apt-get update && apt-get install -y openmpi-bin openmpi-common libopenmpi-dev
+    ```
+
+  </Step>
+  <Step title="Dump HLO from a multi-process run">
+
+    ```bash
+    export XLA_FLAGS="--xla_dump_to=/tmp/dump_multi_process"
+    mpirun --allow-run-as-root -np 8 \
+      test-pax.sh --fsdp 8 --batch-per-gpu 1 -o /tmp/checkpoint --multiprocess
+    ```
+
+  </Step>
+  <Step title="Create a runner script">
+
+    Create `run.sh`:
+
+    ```bash
+    #!/bin/bash
+    export CUDA_VISIBLE_DEVICES=${OMPI_COMM_WORLD_LOCAL_RANK}
+    bazel run //xla/tools/multihost_hlo_runner:hlo_runner_main -- \
+      --task_id=${OMPI_COMM_WORLD_RANK} \
+      --num_nodes=${OMPI_COMM_WORLD_SIZE} \
+      --address=127.0.0.1:12345 \
+      /tmp/dump_multi_process/module_0023.pjit__wrapped_step_fn.before_optimizations.txt
+    ```
+
+  </Step>
+  <Step title="Execute with mpirun">
+
+    ```bash
+    chmod a+x run.sh
+    mpirun --allow-run-as-root -np 8 run.sh
+    ```
+
+  </Step>
+</Steps>
+
+### Multi-node with SLURM
+
+Forward SLURM environment variables to the HLO runner:
+
+```bash
+bazel run //xla/tools/multihost_hlo_runner:hlo_runner_main -- \
+  --task_id=${SLURM_PROCID} \
+  --num_nodes=${SLURM_NTASKS} \
+  --address="${SLURM_LAUNCH_NODE_IPADDR}:12345" \
+  /tmp/dump_multi_process/module_0023.pjit__wrapped_step_fn.before_optimizations.txt
+```
+
+## Troubleshooting
+
+<AccordionGroup>
+
+<Accordion title="Check failed: result.replicas >= 1 (0 vs. 1)">
+
+Not enough GPUs are visible. Ensure:
+- You have enough physical GPUs for the number of replicas required
+- `CUDA_VISIBLE_DEVICES` is either not set, or is set correctly to expose the required GPUs
+
+</Accordion>
+
+<Accordion title="Crashes or unexpected errors">
+
+Try disabling dynamic shapes:
+
+```bash
+bazel run //xla/tools/multihost_hlo_runner:hlo_runner_main -- \
+  --dynamic_mode=off my-hlo.txt
+```
+
+Also verify that CUDA and cuDNN are set up correctly for your environment.
+
+</Accordion>
+
+<Accordion title="Input generation is too slow or uses too much memory">
+
+Use uninitialized inputs to skip input generation entirely:
+
+```bash
+bazel run //xla/tools/multihost_hlo_runner:hlo_runner_main -- \
+  --hlo_argument_mode=uninitialized my-hlo.txt
+```
+
+</Accordion>
+
+</AccordionGroup>

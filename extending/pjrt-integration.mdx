@@ -1,0 +1,316 @@
+---
+title: "PJRT Integration Guide"
+description: "Integrate a new hardware device with ML frameworks using the PJRT Uniform Device API — a stable C and C++ interface for device-specific plugin implementations."
+---
+
+**PJRT** (Portable JAX Runtime) is the uniform Device API for the ML ecosystem. The long-term vision is:
+
+1. Frameworks (JAX, TensorFlow, etc.) call PJRT with device-specific implementations that are opaque to the frameworks.
+2. Each device focuses on implementing the PJRT APIs as a **PJRT plugin**, which can be opaque to the frameworks.
+
+PJRT offers both a **C API** and a **C++ API**. Plugging in at either layer is supported. The C++ API abstracts some concepts using classes but has stronger ties to XLA datatypes.
+
+---
+
+## Resources
+
+<CardGroup cols={2}>
+  <Card title="PJRT C API header" icon="file-code" href="https://github.com/openxla/xla/blob/main/xla/pjrt/c/pjrt_c_api.h">
+    The canonical source of truth for the C API interface.
+  </Card>
+  <Card title="PJRT C API changelog" icon="clock" href="https://github.com/openxla/xla/blob/main/xla/pjrt/c/CHANGELOG.md">
+    Track breaking and non-breaking changes to the API.
+  </Card>
+  <Card title="PJRT integration guide" icon="book" href="https://github.com/openxla/xla/blob/main/xla/pjrt/c/docs/pjrt_integration_guide.md">
+    Detailed integration guide in the XLA repository.
+  </Card>
+  <Card title="OpenXLA/IREE plugin" icon="puzzle" href="https://github.com/openxla/openxla-pjrt-plugin">
+    Reference implementation of a PJRT plugin.
+  </Card>
+</CardGroup>
+
+### Community
+
+- Questions and discussions: [OpenXLA Discord](https://discord.gg/ZKXq7b3V8A)
+- Issues and feature requests: [OpenXLA/xla GitHub](https://github.com/openxla/xla)
+
+---
+
+## ABI versioning
+
+The PJRT C API uses **major.minor versioning**:
+
+- **Major version** increments on ABI-incompatible changes (removing a method, changing argument types, rearranging struct fields).
+- **Minor version** increments on backward-compatible additions.
+
+```c
+// From xla/pjrt/c/pjrt_c_api.h
+#define PJRT_API_MAJOR 0
+// Incremented when the interface is updated in a backward-compatible way.
+// #define PJRT_API_MINOR ...
+```
+
+Struct sizes are tracked explicitly using the `PJRT_STRUCT_SIZE` macro to detect version mismatches at runtime:
+
+```c
+#define PJRT_STRUCT_SIZE(struct_type, last_field) \
+  offsetof(struct_type, last_field) + sizeof(((struct_type*)0)->last_field)
+```
+
+<Note>
+ABI compatibility documentation: [PJRT API ABI versioning and compatibility](https://docs.google.com/document/d/1TKB5NyGtdzrpgw5mpyFjVAhJjpSNdF31T6pjPl_UT2o/edit).
+</Note>
+
+---
+
+## C++ API components
+
+The C++ API organizes a PJRT plugin around five core classes:
+
+<AccordionGroup>
+  <Accordion title="PjRtClient">
+    Manages all communication between the device and framework. Encapsulates all state used in communication, owns devices and memory spaces for a given plugin.
+
+    Reference: [`pjrt_client.h > PjRtClient`](https://github.com/openxla/xla/blob/main/xla/pjrt/pjrt_client.h)
+  </Accordion>
+  <Accordion title="PjRtDevice">
+    Describes a single device. Carries a device description (unique hash for GPU/CPU/xPU identification), local and global location within a grid of devices, and references to associated memory spaces.
+
+    Reference: [`pjrt_client.h > PjRtDevice`](https://github.com/openxla/xla/blob/main/xla/pjrt/pjrt_client.h), [`pjrt_device_description.h`](https://github.com/openxla/xla/blob/main/xla/pjrt/pjrt_device_description.h)
+  </Accordion>
+  <Accordion title="PjRtMemorySpace">
+    Describes a location of memory. Memory spaces can be unpinned (free to live anywhere but accessible from a device) or pinned (must live on a specific device). Each memory space knows its associated buffers and devices.
+
+    Reference: [`pjrt_client.h > PjRtMemorySpace`](https://github.com/openxla/xla/blob/main/xla/pjrt/pjrt_client.h)
+  </Accordion>
+  <Accordion title="PjRtBuffer">
+    Holds data on a device in a format convenient for the plugin. Supports host-to-device transfer via `BufferFromHostBuffer` and device-to-host via `ToLiteral`.
+
+    ```cpp
+    // Host literal → device buffer
+    absl::StatusOr<std::unique_ptr<PjRtBuffer>> BufferFromHostBuffer(...);
+
+    // Device buffer → host literal
+    xla::Future<> ToLiteral(xla::MutableLiteralBase* literal) override;
+    ```
+
+    Reference: [`pjrt_client.h > PjRtBuffer`](https://github.com/openxla/xla/blob/main/xla/pjrt/pjrt_client.h)
+  </Accordion>
+  <Accordion title="PjRtLoadedExecutable">
+    The in-memory compiled executable, ready to accept input arguments. Subclass of `PjRtExecutable`, which handles serialization/deserialization of compiled artifacts.
+
+    ```cpp
+    // Execute on addressable devices
+    absl::StatusOr<std::vector<std::vector<std::unique_ptr<PjRtBuffer>>>>
+    Execute(absl::Span<const std::vector<PjRtBuffer*>> argument_handles, ...);
+
+    // Execute assigned replica/partition on a specific device
+    absl::StatusOr<std::vector<std::unique_ptr<PjRtBuffer>>>
+    ExecuteSharded(absl::Span<PjRtBuffer* const> argument_handles,
+                   PjRtDevice* device, ...);
+    ```
+
+    Reference: [`pjrt_executable.h`](https://github.com/openxla/xla/blob/main/xla/pjrt/pjrt_executable.h), [`pjrt_client.h > PjRtLoadedExecutable`](https://github.com/openxla/xla/blob/main/xla/pjrt/pjrt_client.h)
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Implementing a PJRT plugin
+
+<Steps>
+  <Step title="Implement the PJRT C API interface">
+    There are two options for implementing the [PJRT C API](https://github.com/openxla/xla/blob/main/xla/pjrt/c/pjrt_c_api.h):
+
+    <Tabs>
+      <Tab title="Option A: C API directly">
+        Implement the PJRT C API structs and function pointers directly in C.
+      </Tab>
+      <Tab title="Option B: C++ API + wrapper">
+        Implement the C++ PJRT client (inheriting from the base `PjRtClient`) and use the C→C++ wrapper to expose a C API surface. Only a few additional C methods need to be implemented manually:
+
+        - `PJRT_Client_Create` (required)
+        - `PJRT_TopologyDescription_Create` (optional)
+        - `PJRT_Plugin_Initialize` (optional — one-time plugin setup, called before any other functions)
+        - `PJRT_Plugin_Attributes` (optional)
+
+        ```c++
+        #include "xla/pjrt/c/pjrt_c_api_wrapper_impl.h"
+
+        namespace my_plugin {
+        PJRT_Error* PJRT_Client_Create(PJRT_Client_Create_Args* args) {
+          std::unique_ptr<xla::PjRtClient> client = GetPluginPjRtClient();
+          args->client = pjrt::CreateWrapperClient(std::move(client));
+          return nullptr;
+        }
+        }  // namespace my_plugin
+        ```
+
+        Reference C++ clients: [`pjrt_stream_executor_client.h`](https://github.com/openxla/xla/blob/main/xla/pjrt/pjrt_stream_executor_client.h), [`tfrt_cpu_pjrt_client.h`](https://github.com/openxla/xla/blob/main/xla/pjrt/tfrt_cpu_pjrt_client.h).
+      </Tab>
+    </Tabs>
+  </Step>
+
+  <Step title="Implement GetPjRtApi">
+    Expose a `GetPjRtApi` function that returns a `PJRT_Api*` containing function pointers to your C API implementations.
+
+    ```c++
+    const PJRT_Api* GetPjrtApi() {
+      static const PJRT_Api pjrt_api =
+          pjrt::CreatePjrtApi(my_plugin::PJRT_Client_Create);
+      return &pjrt_api;
+    }
+    ```
+
+    See [`pjrt_c_api_cpu.cc`](https://github.com/openxla/xla/blob/main/xla/pjrt/c/pjrt_c_api_cpu.cc) for a full example.
+  </Step>
+
+  <Step title="Test C API implementations">
+    Call [`RegisterPjRtCApiTestFactory`](https://github.com/openxla/xla/blob/main/xla/pjrt/c/pjrt_c_api_test.h) to run a set of tests for basic PJRT C API behaviors against your implementation.
+  </Step>
+</Steps>
+
+---
+
+## Using a PJRT plugin from JAX
+
+<Steps>
+  <Step title="Set up JAX">
+    Install a JAX nightly build that matches your PJRT C API version:
+
+    ```bash
+    pip install --pre -U jaxlib -i https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/
+    pip install git+https://github.com/google/jax
+    ```
+
+    Or pin to a specific date matching your XLA commit:
+
+    ```bash
+    pip install --pre -U jaxlib==0.6.1.dev20250428 \
+      -i https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/
+    ```
+
+    <Note>
+    You can also [build jaxlib from source](https://jax.readthedocs.io/en/latest/developer.html#building-jaxlib-from-source-with-a-modified-xla-repository) at the exact XLA commit you are building against.
+    </Note>
+  </Step>
+
+  <Step title="Set up plugin discovery">
+    JAX discovers plugins via one of two methods:
+
+    <Tabs>
+      <Tab title="Namespace package">
+        Create a module under the `jax_plugins` namespace package:
+
+        ```
+        jax_plugins/
+          my_plugin/
+            __init__.py
+            my_plugin.so
+        ```
+      </Tab>
+      <Tab title="Package entry point">
+        Advertise the plugin via `pyproject.toml` or `setup.py`:
+
+        ```toml
+        # pyproject.toml
+        [project.entry-points.'jax_plugins']
+        my_plugin = 'my_plugin'
+        ```
+
+        ```python
+        # setup.py
+        entry_points={
+          "jax_plugins": [
+            "my_plugin = my_plugin",
+          ],
+        }
+        ```
+      </Tab>
+    </Tabs>
+  </Step>
+
+  <Step title="Implement initialize()">
+    Add an `initialize()` method in your plugin's Python module to register it with JAX:
+
+    ```python
+    import os
+    import jax._src.xla_bridge as xb
+
+    def initialize():
+        path = os.path.join(os.path.dirname(__file__), 'my_plugin.so')
+        xb.register_plugin('my_plugin', priority=500,
+                           library_path=path, options=None)
+    ```
+
+    To verify the plugin loads and set it as the default backend:
+
+    ```python
+    jax.config.update("jax_platforms", "my_plugin")
+    ```
+
+    Alternatively, set the `JAX_PLATFORMS=my_plugin` environment variable, or use a higher `priority` value when registering.
+  </Step>
+
+  <Step title="Test with JAX">
+    Run basic sanity checks against your plugin:
+
+    ```python
+    # Basic arithmetic
+    print(jax.numpy.add(1, 1))
+    # => 2
+
+    # JIT compilation
+    print(jax.jit(lambda x: x * 2)(1.))
+    # => 2.0
+
+    # Multi-device (pmap)
+    arr = jax.numpy.arange(jax.device_count())
+    print(jax.pmap(lambda x: x + jax.lax.psum(x, 'i'), axis_name='i')(arr))
+    # single device: [0]
+    # 4 devices: [6 7 8 9]
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Advanced features
+
+Extending beyond the base APIs enables more JAX features in your plugin. These are opt-in — a basic JIT and execute workflow functions without them, but a production-quality integration should consider:
+
+- **Memory spaces** — describe distinct memory regions and their device associations
+- **Custom layouts** — control tensor memory layout for your hardware
+- **Communication ops** — send/recv for multi-device communication
+- **Host offloading** — move data between device and host memory
+- **Sharding** — partition computations across multiple devices
+- **Async computations** — use `PjRtBuffer::GetReadyFuture` to return buffers before computation completes
+
+---
+
+## Example implementations
+
+<CardGroup cols={2}>
+  <Card title="XLA CPU plugin" icon="cpu" href="https://github.com/openxla/xla/tree/main/xla/pjrt/cpu/cpu_client.cc">
+    Full PJRT+MLIR+XLA integration for CPU.
+  </Card>
+  <Card title="XLA GPU plugin" icon="microchip" href="https://github.com/openxla/xla/tree/main/xla/pjrt/gpu/se_gpu_pjrt_client.cc">
+    Full PJRT+MLIR+XLA integration for CUDA/ROCm GPUs.
+  </Card>
+  <Card title="Intel XLA plugin" icon="chip" href="https://github.com/intel/intel-extension-for-openxla">
+    Intel hardware extension using full PJRT integration.
+  </Card>
+  <Card title="Tenstorrent XLA plugin" icon="bolt" href="https://github.com/tenstorrent/tt-xla/blob/main/src/common/pjrt_implementation/api_bindings.cc">
+    MLIR-based C plugin for Tenstorrent hardware.
+  </Card>
+</CardGroup>
+
+---
+
+## Further reading
+
+- [PJRT C++ API overview](/reference/pjrt/cpp-api)
+- [Developing a new backend](/extending/developing-new-backend)
+- [XLA Custom Calls (FFI)](/extending/custom-calls)
+- [PJRT design docs](https://drive.google.com/drive/folders/18M944-QQPk1E34qRyIjkqDRDnpMa3miN)
+- [PJRT Plugin Mechanism design doc](https://docs.google.com/document/d/1Qdptisz1tUPGn1qFAVgCV2omnfjN01zoQPwKLdlizas/edit)

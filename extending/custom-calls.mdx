@@ -1,0 +1,377 @@
+---
+title: "XLA Custom Calls (FFI)"
+description: "Use the XLA Foreign Function Interface to register external operations in HLO and call into custom C++ or CUDA code from within XLA programs."
+---
+
+A **custom call** is a mechanism to describe an external operation in an HLO module to the XLA compiler at compile time. **XLA FFI** (Foreign Function Interface) is the mechanism to register the implementation of that operation with XLA at run time.
+
+FFI is a set of C APIs that define a binary interface (ABI) for XLA to call into external code written in other programming languages. XLA provides **header-only C++ bindings** for XLA FFI that hide all low-level C API details from the end user.
+
+<Warning>
+The custom-call API/ABI uses PJRT-style versioning (major, minor), however at this point it is still experimental and can be broken at any time. Once the API/ABI is finalized, stability guarantees similar to PJRT are intended.
+</Warning>
+
+<Warning>
+The HLO-visible names of functions registered with the custom-call macro API do not respect C++ namespaces. Accidental name collisions from functions registered by different libraries are entirely possible. The API will reject duplicate registrations, but to avoid issues in large projects, either fully namespace-qualify all references to functions in both the `XLA_FFI_REGISTER_HANDLER` macros and custom call target references, or use C-style namespacing directly in the function name.
+</Warning>
+
+---
+
+## JAX integration
+
+For end-to-end examples of integrating custom calls and XLA FFI with JAX, see the [JAX FFI documentation](https://jax.readthedocs.io/en/latest/ffi.html).
+
+---
+
+## XLA FFI binding
+
+An XLA FFI **binding** is a compile-time specification of the custom call signature: arguments, attributes, their types, and additional context parameters (such as the GPU stream for GPU backends).
+
+A binding can be bound to any C++ callable — a function pointer, lambda, or any object with a compatible `operator()`. The constructed handler:
+
+1. Decodes the XLA FFI call frame (defined by the stable C API).
+2. Type-checks all parameters.
+3. Forwards decoded results to the user-defined callback.
+
+XLA FFI relies heavily on template metaprogramming to compile handlers to efficient machine code. Run-time overhead is on the order of a few nanoseconds per custom call parameter.
+
+### External vs internal API
+
+<Tabs>
+  <Tab title="External (xla/ffi/api/ffi.h)">
+    Use this for clients that build **shared libraries** containing custom call implementations, loaded at runtime. Depends only on the C API and standard C++ headers. Safe to build with a different compiler or older XLA version.
+
+    ```c++
+    #include "xla/ffi/api/ffi.h"
+    ```
+  </Tab>
+  <Tab title="Internal (xla/ffi/ffi.h)">
+    Use this for clients that **statically link** everything from the same XLA commit with the same compiler toolchain. Provides access to more XLA internals, such as the underlying `se::StreamExecutor` instance.
+
+    ```c++
+    #include "xla/ffi/ffi.h"
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Error handling
+
+Custom call implementations must return `xla::ffi::Error` to signal success or failure to the XLA runtime. It is similar to `absl::Status` and has the same set of error codes. `absl::Status` is not used because it does not have a stable ABI and it would be unsafe to pass across a dynamically loaded library boundary.
+
+```c++
+// Handler that always returns an error.
+auto always_error = Ffi::Bind().To(
+    []() { return Error(ErrorCode::kInternal, "Oops!"); });
+
+// Handler that always returns success.
+auto always_success = Ffi::Bind().To(
+    []() { return Error::Success(); });
+```
+
+---
+
+## Buffer arguments and results
+
+XLA uses **destination passing style** for results: custom calls do not allocate memory. Instead, they write into destination buffers passed by the XLA runtime. XLA uses static buffer assignment and allocates all buffers at compile time based on live ranges.
+
+Results passed to FFI handlers are wrapped in a `Result<T>` template with pointer-like semantics — use `operator->` to access the underlying parameter.
+
+### AnyBuffer
+
+`AnyBuffer` arguments and results accept buffer parameters of any data type. Useful for generic implementations that dispatch based on data type at runtime.
+
+```c++
+// Buffers of any number of dimensions and data type.
+auto handler = Ffi::Bind().Arg<AnyBuffer>().Ret<AnyBuffer>().To(
+    [](AnyBuffer arg, Result<AnyBuffer> res) -> Error {
+      void* arg_data = arg.untyped_data();
+      void* res_data = res->untyped_data();
+      return Error::Success();
+    });
+```
+
+### Constrained buffers
+
+`Buffer<T>` adds constraints on data type and optionally rank. The handler automatically checks these at runtime and returns an error if they are not satisfied.
+
+```c++
+// Buffers of any number of dimensions and F32 data type.
+auto handler = Ffi::Bind().Arg<Buffer<F32>>().Ret<Buffer<F32>>().To(
+    [](Buffer<F32> arg, Result<Buffer<F32>> res) -> Error {
+      float* arg_data = arg.typed_data();
+      float* res_data = res->typed_data();
+      return Error::Success();
+    });
+```
+
+```c++
+// Exactly rank-2 F32 buffers.
+auto handler = Ffi::Bind().Arg<BufferR2<F32>>().Ret<BufferR2<F32>>().To(
+    [](BufferR2<F32> arg, Result<BufferR2<F32>> res) -> Error {
+      float* arg_data = arg.typed_data();
+      float* res_data = res->typed_data();
+      return Error::Success();
+    });
+```
+
+### Variadic arguments and results
+
+When the number of arguments or results can vary between instances of a custom call, use `RemainingArgs` and `RemainingRets` for runtime decoding.
+
+```c++
+auto handler = Ffi::Bind().RemainingArgs().RemainingRets().To(
+    [](RemainingArgs args, RemainingRets results) -> Error {
+      ErrorOr<AnyBuffer> arg = args.get<AnyBuffer>(0);
+      ErrorOr<Result<AnyBuffer>> res = results.get<AnyBuffer>(0);
+
+      if (!arg.has_value()) {
+        return Error(ErrorCode::kInternal, arg.error());
+      }
+      if (!res.has_value()) {
+        return Error(ErrorCode::kInternal, res.error());
+      }
+
+      return Error::Success();
+    });
+```
+
+Variadic arguments and results may be declared after regular ones, but regular arguments/results cannot follow variadic ones.
+
+---
+
+## Attributes
+
+XLA FFI supports automatic decoding of `mlir::DictionaryAttr` passed as the `custom_call` `backend_config` into FFI handler arguments.
+
+```mlir
+%0 = "stablehlo.custom_call"(%arg0) {
+  call_target_name = "foo",
+  backend_config = {
+    i32 = 42 : i32,
+    str = "string"
+  },
+  api_version = 4 : i32
+} : (tensor<f32>) -> tensor<f32>
+```
+
+```c++
+auto handler = Ffi::Bind()
+  .Arg<BufferR0<F32>>()
+  .Attr<int32_t>("i32")
+  .Attr<std::string_view>("str")
+  .To([](BufferR0<F32> buffer, int32_t i32, std::string_view str) {
+    return Error::Success();
+  });
+```
+
+### User-defined enum attributes
+
+XLA FFI can decode integral MLIR attributes into user-defined enums. The enum class must have the same underlying integral type, and decoding must be explicitly registered.
+
+```c++
+enum class Command : int32_t {
+  kAdd = 0,
+  kMul = 1,
+};
+
+XLA_FFI_REGISTER_ENUM_ATTR_DECODING(Command);
+
+auto handler = Ffi::Bind().Attr<Command>("command").To(
+    [](Command command) -> Error { return Error::Success(); });
+```
+
+### User-defined struct attributes
+
+XLA FFI can decode dictionary attributes into user-defined structs using `XLA_FFI_REGISTER_STRUCT_ATTR_DECODING`. Place this macro in the global namespace, as it defines a template specialization in `::xla::ffi`.
+
+```mlir
+%0 = "stablehlo.custom_call"(%arg0) {
+  call_target_name = "foo",
+  backend_config = {
+    range = { lo = 0 : i64, hi = 42 : i64 }
+  },
+  api_version = 4 : i32
+} : (tensor<f32>) -> tensor<f32>
+```
+
+```c++
+struct Range {
+  int64_t lo;
+  int64_t hi;
+};
+
+XLA_FFI_REGISTER_STRUCT_ATTR_DECODING(Range,
+                                      StructMember<int64_t>("lo"),
+                                      StructMember<int64_t>("hi"));
+
+auto handler = Ffi::Bind().Attr<Range>("range").To([](Range range) -> Error {
+  return Error::Success();
+});
+```
+
+### Dictionary access
+
+To lazily decode only needed attributes at runtime, bind all attributes as a `Dictionary`:
+
+```c++
+auto handler = Ffi::Bind().Attrs().To([](Dictionary attrs) -> Error {
+  ErrorOr<int32_t> i32 = attrs.get<int32_t>("i32");
+  ErrorOr<Range> range = attrs.get<Range>("range");
+  return Error::Success();
+});
+```
+
+---
+
+## Complete examples
+
+### CPU custom call
+
+The following creates an HLO custom call that computes `A[i] = B[i % 128] + C[i]` on the CPU.
+
+```c++
+#include "xla/hlo/builder/xla_builder.h"
+#include "xla/ffi/api/ffi.h"
+
+void do_it() {
+  xla::XlaBuilder b("do_it");
+  xla::XlaOp param0 =
+      xla::Parameter(&b, 0, xla::ShapeUtil::MakeShape(xla::F32, {128}), "p0");
+  xla::XlaOp param1 =
+      xla::Parameter(&b, 1, xla::ShapeUtil::MakeShape(xla::F32, {2048}), "p1");
+  xla::XlaOp custom_call =
+      xla::CustomCall(&b, "do_custom_call", /*operands=*/{param0, param1},
+        /*shape=*/xla::ShapeUtil::MakeShape(xla::F32, {2048}),
+        /*opaque=*/"", /*has_side_effect=*/false,
+        /*output_operand_aliasing=*/{}, /*literal=*/nullptr,
+        /*schedule=*/CustomCallSchedule::SCHEDULE_NONE,
+        /*api_version=*/CustomCallApiVersion::API_VERSION_TYPED_FFI);
+}
+
+// Constrain custom call arguments to 1-dimensional buffers of F32 data type.
+using BufferF32 = xla::ffi::BufferR1<xla::ffi::DataType::F32>;
+
+// Implement the custom call handler.
+xla::ffi::Error do_custom_call(BufferF32 in0, BufferF32 in1,
+                                xla::ffi::Result<BufferF32> out) {
+  size_t d0 = in0.dimensions[0];
+  size_t d1 = in1.dimensions[0];
+
+  assert(out->dimensions[0] == d1 && "unexpected dimensions");
+
+  for (size_t i = 0; i < d1; ++i) {
+    out->data[i] = in0.data[i % d0] + in1.data[i];
+  }
+  return xla::ffi::Error::Success();
+}
+
+// Define the handler with explicit type signature.
+XLA_FFI_DEFINE_HANDLER(handler, do_custom_call,
+                       ffi::Ffi::Bind()
+                           .Arg<Buffer>()
+                           .Arg<Buffer>()
+                           .Ret<Buffer>());
+
+// Register the handler on the "Host" platform.
+XLA_FFI_REGISTER_HANDLER(xla::ffi::GetXlaFfiApi(), "do_custom_call",
+                         "Host", handler);
+```
+
+### GPU custom call (CUDA)
+
+GPU custom call registration is nearly identical to CPU. The key difference is requesting the platform stream (CUDA or ROCm) as a context argument to launch kernels on device.
+
+<Note>
+The GPU custom call function is still a **CPU function**. It is responsible for enqueuing work on the GPU — for example, launching a CUDA kernel or calling cuBLAS. Arguments and results live on the host; the `data` member contains a pointer to device (GPU) memory.
+</Note>
+
+```c++
+__global__ void custom_call_kernel(const float* in0, const float* in1,
+                                   float* out) {
+  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  out[idx] = in0[idx % 128] + in1[idx];
+}
+
+void do_custom_call(CUstream stream, BufferF32 in0, BufferF32 in1,
+                    xla::ffi::Result<BufferF32> out) {
+  size_t d0 = in0.dimensions[0];
+  size_t d1 = in1.dimensions[0];
+  size_t d2 = out->dimensions[0];
+
+  assert(d0 == 128 && d1 == 2048 && d2 == 2048 && "unexpected dimensions");
+
+  const int64_t block_dim = 64;
+  const int64_t grid_dim = 2048 / block_dim;
+  custom_call_kernel<<<grid_dim, block_dim, 0, stream>>>(
+    in0.data, in1.data, out->data);
+}
+
+XLA_FFI_DEFINE_HANDLER(handler, do_custom_call,
+                       ffi::Ffi::Bind()
+                           .Ctx<xla::ffi::PlatformStream<CUstream>>()
+                           .Arg<BufferF32>()
+                           .Arg<BufferF32>()
+                           .Ret<BufferF32>());
+
+XLA_FFI_REGISTER_HANDLER(xla::ffi::GetXlaFfiApi(), "do_custom_call",
+                         "CUDA", handler);
+```
+
+---
+
+## Tuple arguments and results
+
+On both CPU and GPU, a tuple is represented in memory as an array of pointers. XLA flattens tuple arguments and results and passes them as regular buffer arguments.
+
+### Tuple outputs as temporary buffers
+
+Tuple outputs serve two purposes:
+
+1. **Returning multiple independent arrays** from a single custom call.
+2. **Providing temporary memory** — an output buffer can be written to and read from within the same operation. If an output tuple element is never consumed by downstream HLO, it acts as scratch space.
+
+```c++
+using xla::ShapeUtil;
+using xla::F32;
+
+// Input: nested tuple
+Shape p0_shape = ShapeUtil::MakeTuple({
+    ShapeUtil::MakeShape(F32, {32}),
+    ShapeUtil::MakeTuple({
+        ShapeUtil::MakeShape(F32, {64}),
+        ShapeUtil::MakeShape(F32, {128}),
+    }),
+    ShapeUtil::MakeShape(F32, {256}),
+});
+
+// Output: tuple where index 1 is used as temp storage
+Shape out_shape = ShapeUtil::MakeTuple({
+  ShapeUtil::MakeShape(F32, {512}),
+  ShapeUtil::MakeShape(F32, {1024}),  // temp buffer — never read downstream
+});
+
+xla::CustomCall(&b, "do_custom_call", /*operands=*/{p0}, out_shape, ...);
+```
+
+---
+
+## Registration macro reference
+
+| Macro | Purpose |
+|---|---|
+| `XLA_FFI_DEFINE_HANDLER(name, fn, binding)` | Defines a handler with an explicit binding and type-checks it against the function signature. |
+| `XLA_FFI_REGISTER_HANDLER(api, target_name, platform, handler)` | Registers the handler globally for a given platform (`"Host"`, `"CUDA"`, `"ROCM"`, etc.). |
+| `XLA_FFI_REGISTER_ENUM_ATTR_DECODING(EnumType)` | Registers decoding for a user-defined enum from integral MLIR attributes. |
+| `XLA_FFI_REGISTER_STRUCT_ATTR_DECODING(StructType, ...)` | Registers decoding for a user-defined struct from a dictionary attribute. Must be placed in the global namespace. |
+
+---
+
+## Further reading
+
+- [JAX FFI documentation](https://jax.readthedocs.io/en/latest/ffi.html)
+- [StableHLO custom_call RFC](https://github.com/openxla/stablehlo/blob/main/rfcs/20240312-standardize-customcallop.md)
+- [XLA FFI source — `xla/ffi/`](https://github.com/openxla/xla/tree/main/xla/ffi)
+- [XLA FFI external API header](https://github.com/openxla/xla/blob/main/xla/ffi/api/ffi.h)
+- [Developing a new backend](/extending/developing-new-backend)
